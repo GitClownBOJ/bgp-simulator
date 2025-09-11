@@ -5,26 +5,26 @@ A C++-based simulator for visualizing BGP routing and exploring Layer 3 vulnerab
 # Features
 
 * Core BGP-4
-  1. Models the full path-vector logic for BGP-4 over IPv4
-  2. Routers establish simulated TCP connections and exchange BGP messages (OPEN, UPDATE, NOTIFICATION, KEEPALIVE)
-  3.  "Cold start" functionality: routers discover neighbors and build routing tables from scratch
-  4.   Simulates error conditions, such as routers going offline and links being dropped
+  - Models the full path-vector logic for BGP-4 over IPv4
+  - Routers establish simulated TCP connections and exchange BGP messages (OPEN, UPDATE, NOTIFICATION, KEEPALIVE)
+  - "Cold start" functionality: routers discover neighbors and build routing tables from scratch
+  - Simulates error conditions, such as routers going offline and links being dropped
 
 * Customizable network environment
-  1. Network topology is fully customizable via a configuration file, specifying routers and their links
-  2.  Administrators can enforce local policies on each router to influence path selection
+  - Network topology is fully customizable via a configuration file, specifying routers and their links
+  -  Administrators can enforce local policies on each router to influence path selection
 
 * Low-level packet processing
-  1. Simulates IP packet forwarding based on the constructed routing tables
-  2. Routers process incoming packets as a stream of bits, parsing IPv4 header fields to make forwarding decisions
-  3. Includes a set of manually created IP packets for simulation scenarios
+  - Simulates IP packet forwarding based on the constructed routing tables
+  - Routers process incoming packets as a stream of bits, parsing IPv4 header fields to make forwarding decisions
+  - Includes a set of manually created IP packets for simulation scenarios
 
 * Trust and reputation system
- 1. Implements a dynamic, voting-based trust model to secure routing decisions
- 2. Trust information is exchanged between routers, either via a new BGP message type
- 3. Neighbors of neighbors vote on a router's reliability
- 4. A "total trust" score is calculated
- 5. The final trust value is integrated into the BGP best-path selection algorithm
+  - Implements a dynamic, voting-based trust model to secure routing decisions
+ - Trust information is exchanged between routers, either via a new BGP message type
+ -  Neighbors of neighbors vote on a router's reliability
+ -  A "total trust" score is calculated
+ -  The final trust value is integrated into the BGP best-path selection algorithm
 
 * Attack simulation
   - Designate a malicious router to broadcast false route announcements to test the effectiveness of the trust system
