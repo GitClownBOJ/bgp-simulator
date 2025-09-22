@@ -61,6 +61,20 @@ enum class OriginType {
     INCOMPLETE = 2
 };
 
+enum class PolicyDirection {
+    INBOUND,
+    OUTBOUND
+};
+
+enum class PolicyAction {
+    PERMIT,
+    DENY,
+    SET_LOCAL_PREF,
+    AS_PATH_PREPEND
+};
+
+
+
 struct Header
 {
     MessageType type;
@@ -91,6 +105,16 @@ struct UpdateMessage : public Header
     std::vector<IpPrefix> withdrawn_routes;
 };
 
+struct Policy
+{
+    std::string rule_name;
+    PolicyDirection direction;
+    PolicyAction action;
+    std::string match_peer_ip; // For simplicity, match only on peer IP
+    IpPrefix match_prefix;      // Match on specific prefix
+    int action_value;        // e.g., local pref value or AS path prepend count
+};
+
 // Forward declarations
 class Router;
 
@@ -112,6 +136,7 @@ public:
     std::string router_id;
     int as_number;
     static std::map<std::string, Router*> network;
+    std::vector<Policy> policies;
 
     Router(const std::string& id, int as_num) : router_id(id), as_number(as_num) {
         network[id] = this;
@@ -161,7 +186,7 @@ void tick() {
         }
     }
 
-      void receive_message(const std::string& from_ip, const Header& message) {
+      void receive_message(const std::string& from_ip, const Header& message) { //IP address of the sender peer and the BGP message itself
         Peer& peer = peers.at(from_ip);
         switch (message.type) {
             case MessageType::OPEN:
@@ -181,10 +206,10 @@ void tick() {
     }
 
       void forward_packet(const IpPacket& packet) {
-        std::cout << "\n📦 " << router_id << ": Received packet for destination " << packet.destination_ip << std::endl;
+        std::cout << "\nPacket arriving: " << router_id << ": Received packet for destination " << packet.destination_ip << std::endl; // The router receives a packet to forward
 
-        const Route* best_match_route = nullptr;
-        int longest_match_len = -1;
+        const Route* best_match_route = nullptr; // No best match has been found yet
+        int longest_match_len = -1; // Any valid prefix length will be longer than this
 
         for (const auto& [prefix, route] : routing_table) {
             // Simple string-based check for Longest Prefix Match
@@ -195,12 +220,12 @@ void tick() {
                 }
             }
         }
-
+        // best_match_route now points to the best matching route, if any: best match is the one with the most specific prefix (longest in bits)
         if (best_match_route) {
-            std::cout << "  ✅ Match found for prefix " << best_match_route->prefix.network_address << "/" << best_match_route->prefix.prefix_length << "." << std::endl;
-            std::cout << "  ➡️ Forwarding packet to next hop: " << best_match_route->next_hop_ip << std::endl;
+            std::cout << "  Match found for prefix " << best_match_route->prefix.network_address << "/" << best_match_route->prefix.prefix_length << "." << std::endl;
+            std::cout << "  Forwarding packet to next hop: " << best_match_route->next_hop_ip << std::endl;
         } else {
-            std::cout << "  ❌ No route found. Packet dropped." << std::endl;
+            std::cout << "  No route found. Packet dropped." << std::endl;
         }
     }
 
@@ -222,6 +247,10 @@ void tick() {
         std::cout << "------------------------------------------" << std::endl;
     }
 
+    void add_policy_rule(const Policy& rule) {
+        policies.push_back(rule);
+    }
+
 private:
     std::string router_id;
     int as_number;
@@ -237,7 +266,7 @@ private:
     void handle_open(Peer& peer, const OpenMessage& message) {
         std::cout << router_id << " <- " << peer.peer_ip << ": Received OPEN." << std::endl;
         if (peer.state == SessionState::OPEN_SENT) {
-            std::cout << "   🤝 Session ESTABLISHED with " << peer.peer_ip << std::endl;
+            std::cout << "Session ESTABLISHED with " << peer.peer_ip << std::endl;
             peer.state = SessionState::ESTABLISHED;
             KeepaliveMessage keepalive;
             send_message(peer.peer_ip, keepalive);
@@ -281,7 +310,7 @@ private:
             } else {
                 // If we have a route, compare AS_PATH length (shorter is better)
                 Route& existing_route = routing_table.at(candidate_route.prefix);
-                if (candidate_route.as_path.size() < existing_route.as_path.size()) {
+                if (candidate_route.as_path.size() < existing_route.as_path.size()) { //UPDATE ROUTE STRUCT TO INCLUDE OTHER ATTRIBUTES
                     existing_route = candidate_route;
                     table_changed = true;
                 }
@@ -360,3 +389,4 @@ int main() {
 
 // Define the static member variable
 std::map<std::string, Router*> Router::network;
+
