@@ -1,20 +1,21 @@
 #include <iostream>
 #include <vector>
 #include <string>
-#include <list> // For AS_PATH
+#include <list>
 #include <map>
-#include <memory> // For smart pointers
+#include <memory>
+#include <unordered_map>
+#include <fstream>
+#include <getopt.h>
+#include <sstream>
 
-// IpPacket struct definition
 struct IpPacket {
     std::string destination_ip;
     std::string source_ip;
     std::string payload;
 };
 
-
-struct IpPrefix
-{
+struct IpPrefix {
     std::string network_address;
     int prefix_length;
 
@@ -29,17 +30,21 @@ struct IpPrefix
     }
 };
 
-struct Route
-{
+enum class OriginType {
+    IGP = 0,
+    EGP = 1,
+    INCOMPLETE = 2
+};
+
+struct Route {
     IpPrefix prefix;
     std::string next_hop_ip;
-    std::list<int> as_path; // AS_PATH represented as a list of AS numbers
-    int local_pref;
-    int med;
+    std::list<int> as_path;
+    int local_pref = 100;
+    int med = 0;
     OriginType origin;
 };
 
-// possible states a BGP peering session can be in
 enum class SessionState {
     IDLE,
     CONNECT,
@@ -55,12 +60,6 @@ enum class MessageType {
     KEEPALIVE = 4
 };
 
-enum class OriginType {
-    IGP = 0,
-    EGP = 1,
-    INCOMPLETE = 2
-};
-
 enum class PolicyDirection {
     INBOUND,
     OUTBOUND
@@ -73,54 +72,43 @@ enum class PolicyAction {
     AS_PATH_PREPEND
 };
 
-
-
-struct Header
-{
+struct Header {
     MessageType type;
 };
 
-struct KeepaliveMessage : public Header
-{
+struct KeepaliveMessage : public Header {
     KeepaliveMessage() { type = MessageType::KEEPALIVE; }
 };
 
-struct NotificationMessage : public Header
-{
+struct NotificationMessage : public Header {
     NotificationMessage() { type = MessageType::NOTIFICATION; }
     int error_code;
 };
 
-struct OpenMessage : public Header
-{
+struct OpenMessage : public Header {
     OpenMessage() { type = MessageType::OPEN; }
     std::string router_id;
     int as_number;
 };
 
-struct UpdateMessage : public Header
-{
+struct UpdateMessage : public Header {
     UpdateMessage() { type = MessageType::UPDATE; }
     std::vector<Route> advertised_routes;
     std::vector<IpPrefix> withdrawn_routes;
 };
 
-struct Policy
-{
+struct Policy {
     std::string rule_name;
     PolicyDirection direction;
     PolicyAction action;
-    std::string match_peer_ip; // For simplicity, match only on peer IP
-    IpPrefix match_prefix;      // Match on specific prefix
-    int action_value;        // e.g., local pref value or AS path prepend count
+    std::string match_peer_ip;
+    IpPrefix match_prefix;
+    int action_value;
 };
 
-// Forward declarations
 class Router;
 
-// each peer has its own state and is associated with a local router
-struct Peer
-{
+struct Peer {
     std::string peer_ip;
     int peer_as;
     SessionState state;
@@ -130,46 +118,50 @@ struct Peer
         : peer_ip(ip), peer_as(as), state(SessionState::IDLE), local_router(router) {}
 };
 
-class Router
-{
+class Router {
 public:
     std::string router_id;
     int as_number;
     static std::map<std::string, Router*> network;
     std::vector<Policy> policies;
 
-    Router(const std::string& id, int as_num) : router_id(id), as_number(as_num) {
+    Router(const std::string& id, int as_num) : router_id_(id), as_number_(as_num), router_id(id), as_number(as_num) {
         network[id] = this;
     }
-    void receive_message(Peer& peer, const Header& message);
+
+    ~Router() = default;
+    
+    Router(const Router&) = delete;
+    Router& operator=(const Router&) = delete;
+    Router(Router&&) = default;
+    Router& operator=(Router&&) = default;
+
     void add_peer(const std::string& ip, int as) {
-        peers.emplace(ip, Peer(ip, as, this));
+        peers_.emplace(ip, Peer(ip, as, this));
     }
 
-    // Originate a route from this router
     void originate_route(const IpPrefix& prefix) {
         std::cout << "Router " << router_id << " originating route " 
                   << prefix.network_address << "/" << prefix.prefix_length << std::endl;
-                  Route new_route;
-                    new_route.prefix = prefix;
-                    new_route.next_hop_ip = router_id;
-                    new_route.as_path.push_back(this->as_number);
-                    new_route.origin = OriginType::IGP;
+        Route new_route;
+        new_route.prefix = prefix;
+        new_route.next_hop_ip = router_id;
+        new_route.as_path.push_back(this->as_number);
+        new_route.origin = OriginType::IGP;
 
-                    routing_table[prefix] = new_route;
+        routing_table_[prefix] = new_route;
 
-                    UpdateMessage update;
-                    update.advertised_routes.push_back(new_route);
-                    for(auto const& [peer_ip, peer] : peers) {
-                        if(peer.state == SessionState::ESTABLISHED) {
-                            send_message(peer_ip, update);
-                        }
-                    }
+        UpdateMessage update;
+        update.advertised_routes.push_back(new_route);
+        for(auto const& [peer_ip, peer] : peers_) {
+            if(peer.state == SessionState::ESTABLISHED) {
+                send_message(peer_ip, update);
+            }
+        }
     }
 
-    // Proactive actions: initiating connections, sending keepalives
-void tick() {
-        for (auto& [peer_ip, peer] : peers) {
+    void tick() {
+        for (auto& [peer_ip, peer] : peers_) {
             if (peer.state == SessionState::IDLE) {
                 std::cout << router_id << " -> " << peer_ip << ": Sending OPEN." << std::endl;
                 OpenMessage open;
@@ -186,8 +178,8 @@ void tick() {
         }
     }
 
-      void receive_message(const std::string& from_ip, const Header& message) { //IP address of the sender peer and the BGP message itself
-        Peer& peer = peers.at(from_ip);
+    void receive_message(const std::string& from_ip, const Header& message) { //IP address of the sender peer and the BGP message itself
+        Peer& peer = peers_.at(from_ip);
         switch (message.type) {
             case MessageType::OPEN:
                 handle_open(peer, static_cast<const OpenMessage&>(message));
@@ -205,13 +197,13 @@ void tick() {
         }
     }
 
-      void forward_packet(const IpPacket& packet) {
+    void forward_packet(const IpPacket& packet) {
         std::cout << "\nPacket arriving: " << router_id << ": Received packet for destination " << packet.destination_ip << std::endl; // The router receives a packet to forward
 
         const Route* best_match_route = nullptr; // No best match has been found yet
         int longest_match_len = -1; // Any valid prefix length will be longer than this
 
-        for (const auto& [prefix, route] : routing_table) {
+        for (const auto& [prefix, route] : routing_table_) {
             // Simple string-based check for Longest Prefix Match
             if (packet.destination_ip.rfind(prefix.network_address, 0) == 0) {
                 if (prefix.prefix_length > longest_match_len) {
@@ -229,13 +221,13 @@ void tick() {
         }
     }
 
-  void print_routing_table() {
+    void print_routing_table() {
         std::cout << "\n--- Routing Table for " << router_id << " (AS " << as_number << ") ---" << std::endl;
-        if(routing_table.empty()) {
+        if(routing_table_.empty()) {
             std::cout << "(Table is empty)" << std::endl;
             return;
         }
-        for(const auto& [prefix, route] : routing_table) {
+        for(const auto& [prefix, route] : routing_table_) {
             std::cout << "  " << prefix.network_address << "/" << prefix.prefix_length 
                       << " -> next-hop: " << route.next_hop_ip
                       << ", AS_PATH: [ ";
@@ -252,12 +244,12 @@ void tick() {
     }
 
 private:
-    std::string router_id;
-    int as_number;
-    std::map<std::string, Peer> peers; // Keyed by peer IP
-    std::map<IpPrefix, Route> routing_table; // for the routing table, each IpPrefix key represents a network prefix (address + length)
+    std::string router_id_;
+    int as_number_;
+    std::map<std::string, Peer> peers_; // Keyed by peer IP
+    std::map<IpPrefix, Route> routing_table_; // for the routing table, each IpPrefix key represents a network prefix (address + length)
 
-         void send_message(const std::string& to_ip, const Header& message) {
+    void send_message(const std::string& to_ip, const Header& message) {
         if (network.count(to_ip)) {
             network[to_ip]->receive_message(this->router_id, message);
         }
@@ -272,9 +264,9 @@ private:
             send_message(peer.peer_ip, keepalive);
 
             // Now that we're connected, advertise our own routes
-            if(!routing_table.empty()){
+            if(!routing_table_.empty()){
                 UpdateMessage update_for_new_peer;
-                for(const auto& [prefix, route] : routing_table) {
+                for(const auto& [prefix, route] : routing_table_) {
                      // Only advertise routes we originated ourselves
                     if(route.next_hop_ip == "0.0.0.0") {
                         update_for_new_peer.advertised_routes.push_back(route);
@@ -286,7 +278,8 @@ private:
             }
         }
     }
- void handle_keepalive(Peer& peer, const KeepaliveMessage& message) {
+
+    void handle_keepalive(Peer& peer, const KeepaliveMessage& message) {
          if (peer.state == SessionState::ESTABLISHED) {
             // std::cout << router_id << " <- " << peer.peer_ip << ": Received KEEPALIVE." << std::endl;
         }
@@ -302,30 +295,49 @@ private:
             Route candidate_route = new_route_info;
             candidate_route.next_hop_ip = peer.peer_ip; // The next hop is the peer who sent us the message
 
+            if (!this->apply_inbound_policies(candidate_route, peer)) {
+                std::cout << "   Route " << candidate_route.prefix.network_address << "/" << candidate_route.prefix.prefix_length 
+                          << " denied by inbound policy from " << peer.peer_ip << std::endl;
+                continue; // Skip this route
+            }
+
+
             // BGP decision process
-            if (routing_table.count(candidate_route.prefix) == 0) {
+            if (routing_table_.count(candidate_route.prefix) == 0) {
                 // If we have no route, we accept this one
-                routing_table[candidate_route.prefix] = candidate_route;
+              routing_table_[candidate_route.prefix] = candidate_route;
+            table_changed = true;
+        } else {
+            Route& existing_route = routing_table_.at(candidate_route.prefix);
+            // Higher LOCAL_PREF is better
+            if (candidate_route.local_pref > existing_route.local_pref) {
+                existing_route = candidate_route;
                 table_changed = true;
-            } else {
-                // If we have a route, compare AS_PATH length (shorter is better)
-                Route& existing_route = routing_table.at(candidate_route.prefix);
-                if (candidate_route.as_path.size() < existing_route.as_path.size()) { //UPDATE ROUTE STRUCT TO INCLUDE OTHER ATTRIBUTES
-                    existing_route = candidate_route;
-                    table_changed = true;
-                }
+            } 
+            // Shorter AS_PATH is better (only if LOCAL_PREF is equal)
+            else if (candidate_route.local_pref == existing_route.local_pref &&
+                       candidate_route.as_path.size() < existing_route.as_path.size()) {
+                existing_route = candidate_route;
+                table_changed = true;
             }
         }
+    }
 
         if (table_changed) {
             std::cout << "   " << router_id << "'s routing table changed. Propagating updates." << std::endl;
             // Propagate the best routes to our other peers
-            for (auto const& [next_peer_ip, next_peer] : peers) {
+            for (auto const& [next_peer_ip, next_peer] : peers_) {
                 if (next_peer_ip != peer.peer_ip && next_peer.state == SessionState::ESTABLISHED) {
                     UpdateMessage downstream_update;
-                    for (const auto& [prefix, route] : routing_table) {
+                    for (const auto& [prefix, route] : routing_table_) {
                         Route new_advertisement = route;
                         new_advertisement.as_path.push_front(this->as_number); // Prepend our AS
+
+                        if (!apply_outbound_policies(new_advertisement, next_peer)) {
+                            std::cout << "   Route " << new_advertisement.prefix.network_address << "/" << new_advertisement.prefix.prefix_length 
+                                      << " denied by outbound policy to " << next_peer.peer_ip << std::endl;
+                            continue; // Skip this route
+                        }
                         downstream_update.advertised_routes.push_back(new_advertisement);
                     }
                     send_message(next_peer_ip, downstream_update);
@@ -333,60 +345,247 @@ private:
             }
         }
     }
+
+    bool apply_inbound_policies(Route& route, const Peer& peer) { // Modify the route in place based on policy action
+        for (const auto& policy : policies) {
+            if (policy.direction == PolicyDirection::INBOUND) {
+                if (policy.match_peer_ip == peer.peer_ip || policy.match_prefix == route.prefix) {
+                    if (policy.action == PolicyAction::DENY) {
+                        return false; // Route is denied
+                    }
+                    else if (policy.action == PolicyAction::SET_LOCAL_PREF) {
+                        route.local_pref = policy.action_value;
+                    } else if (policy.action == PolicyAction::AS_PATH_PREPEND) {
+                        for (int i = 0; i < policy.action_value; ++i) {
+                            route.as_path.push_front(this->as_number);
+                        }
+                    }
+                    // Actions like PERMIT are implicit; if no DENY matches, the route is permitted
+                }
+            }
+        }
+        return true; // Route is permitted
+    }
+
+    bool apply_outbound_policies(Route& route, const Peer& peer) {
+        for (const auto& policy : policies) {
+            if (policy.direction == PolicyDirection::OUTBOUND) {
+                if (policy.match_peer_ip == peer.peer_ip || policy.match_prefix == route.prefix) { // Check if the policy matches the peer IP or prefix
+                    if (policy.action == PolicyAction::DENY) {
+                        return false;
+                    } else if (policy.action == PolicyAction::SET_LOCAL_PREF) {
+                        route.local_pref = policy.action_value;
+                    } else if (policy.action == PolicyAction::AS_PATH_PREPEND) {
+                        for (int i = 0; i < policy.action_value; ++i) {
+                            route.as_path.push_front(this->as_number);
+                        }
+                    }
+                }
+            }
+        }
+        return true;
+    }
 };
 
-int main() {
+void load_topology(const std::string& filename, std::vector<Router*>& all_routers) {
+    std::ifstream infile(filename);
+    std::string line;
+    enum Section { NONE, ROUTERS, LINKS };
+    Section current = NONE;
+
+    // Temporary map for AS lookup
+    std::map<std::string, int> router_as_map;
+
+    while (std::getline(infile, line)) {
+        // Remove comments and trim
+        auto comment_pos = line.find('#');
+        if (comment_pos != std::string::npos) line = line.substr(0, comment_pos);
+        std::istringstream iss(line);
+        std::string token;
+        if (!(iss >> token)) continue; // skip empty
+
+        if (token == "[Routers]") {
+            current = ROUTERS;
+            continue;
+        }
+        if (token == "[Links]") {
+            current = LINKS;
+            continue;
+        }
+
+        if (current == ROUTERS) {
+            // RouterID AS_Number
+            std::string router_id = token;
+            int asn;
+            if (!(iss >> asn)) continue;
+            auto* r = new Router(router_id, asn);
+            all_routers.push_back(r);
+            Router::network[router_id] = r;
+            router_as_map[router_id] = asn;
+        } else if (current == LINKS) {
+            // Format: RouterID1 RouterID2
+            std::string router1 = token, router2;
+            if (!(iss >> router2)) continue;
+            // Add peers both ways
+            int as1 = router_as_map[router1];
+            int as2 = router_as_map[router2];
+            if (Router::network.count(router1) && Router::network.count(router2)) {
+                Router::network[router1]->add_peer(router2, as2);
+                Router::network[router2]->add_peer(router1, as1);
+            }
+        }
+    }
+}
+
+int main(int argc, char* argv[]) {
+    std::string topology_file;
+    int opt;
+    while ((opt = getopt(argc, argv, "c:")) != -1) { // -c for config file
+        if (opt == 'c') topology_file = optarg;
+    }
+
+    std::vector<Router*> all_routers;
+    if (!topology_file.empty()) {
+        load_topology(topology_file, all_routers);
+        std::cout << "\n--- Establishing BGP Sessions ---" << std::endl;
+    for (int i = 0; i < 3; ++i) {
+        std::cout << "\n--- Tick " << i + 1 << " ---" << std::endl;
+        for(Router* r : all_routers) {
+            r->tick();
+        }
+    }
+
+    std::cout << "\n--- Route Origination and Propagation ---" << std::endl;
+    // Example: originate a route from the first router
+    if (!all_routers.empty()) {
+        all_routers[0]->originate_route({"10.10.10.0", 24});
+    }
+
+    for (int i = 0; i < 5; ++i) {
+        std::cout << "\n--- Tick " << i + 4 << " ---" << std::endl;
+        for(Router* r : all_routers) {
+            r->tick();
+        }
+    }
+
+    // Print routing tables for all routers
+    for(Router* r : all_routers) {
+        r->print_routing_table();
+    }
+
+    // Optional: test packet forwarding
+    if (all_routers.size() > 1) {
+        IpPacket test_packet;
+        test_packet.source_ip = "10.10.10.10";
+        test_packet.destination_ip = "10.10.10.20";
+        test_packet.payload = "Test!";
+        all_routers[0]->forward_packet(test_packet);
+    }
+    } else {
     std::cout << "--- BGP Simulator Startup ---" << std::endl;
 
-    // Routers for the simulation
-    Router r1("1.1.1.1", 100);
-    Router r2("2.2.2.2", 200);
-    Router r3("3.3.3.3", 300);
+// AS 65001
+    Router r1("10.0.1.1", 65001);
+    Router r2("10.0.1.2", 65001);
+    Router r3("10.0.1.3", 65001);
 
-    // Topology (peering)
-    r1.add_peer("2.2.2.2", 200);
-    r2.add_peer("1.1.1.1", 100);
-    r2.add_peer("3.3.3.3", 300);
-    r3.add_peer("2.2.2.2", 200);
+    // AS 65002
+    Router r4("10.0.2.4", 65002);
+    Router r5("10.0.2.5", 65002);
+    
+    // AS 65003
+    Router r6("10.0.3.6", 65003);
+    Router r7("10.0.3.7", 65003);
+    Router r8("10.0.3.8", 65003);
+    
+    // AS 65004
+    Router r9("10.0.4.9", 65004);
+    Router r10("10.0.4.10", 65004);
 
-    // Simulation ticks to establish sessions
+    // Helper vector to easily iterate over all routers
+    std::vector<Router*> all_routers = {&r1, &r2, &r3, &r4, &r5, &r6, &r7, &r8, &r9, &r10};
+
+    // Peering topology setup
+    
+    // iBGP Peering (Full mesh within each AS using Router IDs)
+    r1.add_peer(r2.router_id, 65001); r1.add_peer(r3.router_id, 65001);
+    r2.add_peer(r1.router_id, 65001); r2.add_peer(r3.router_id, 65001);
+    r3.add_peer(r1.router_id, 65001); r3.add_peer(r2.router_id, 65001);
+    
+    r4.add_peer(r5.router_id, 65002);
+    r5.add_peer(r4.router_id, 65002);
+
+    r6.add_peer(r7.router_id, 65003); r6.add_peer(r8.router_id, 65003);
+    r7.add_peer(r6.router_id, 65003); r7.add_peer(r8.router_id, 65003);
+    r8.add_peer(r6.router_id, 65003); r8.add_peer(r7.router_id, 65003);
+
+    r9.add_peer(r10.router_id, 65004);
+    r10.add_peer(r9.router_id, 65004);
+
+    // -- eBGP Peering (Between border routers) --
+    r3.add_peer(r4.router_id, 65002);
+    r4.add_peer(r3.router_id, 65001);
+
+    r4.add_peer(r6.router_id, 65003);
+    r6.add_peer(r4.router_id, 65002);
+    
+    r5.add_peer(r10.router_id, 65004);
+    r10.add_peer(r5.router_id, 65002);
+    
+    r8.add_peer(r9.router_id, 65004);
+    r9.add_peer(r8.router_id, 65003);
+    
+
+    // Configuring a policy on AS 65003
+
+    Policy prefer_as65004;
+    prefer_as65004.rule_name = "Prefer-AS65004-Path";
+    prefer_as65004.direction = PolicyDirection::INBOUND; // Inbound policy on R8
+    prefer_as65004.action = PolicyAction::SET_LOCAL_PREF;
+    prefer_as65004.match_peer_ip = r9.router_id; // Match routes from R9
+    prefer_as65004.action_value = 200; // Default Local Pref is 100
+    // r8.add_policy_rule(prefer_as65004); // NOTE: This requires fixing inbound policy modification
+
+    // Simulation ticks
     std::cout << "\n--- Establishing BGP Sessions ---" << std::endl;
-    for (int i = 0; i < 2; ++i) {
+    for (int i = 0; i < 3; ++i) {
         std::cout << "\n--- Tick " << i + 1 << " ---" << std::endl;
-        r1.tick();
-        r2.tick();
-        r3.tick();
+        for(Router* r : all_routers) {
+            r->tick();
+        }
     }
     
-    // A router originates a route
     std::cout << "\n--- Route Origination and Propagation ---" << std::endl;
-    IpPrefix prefix_to_advertise = {"10.1.0.0", 16};
-    r1.originate_route(prefix_to_advertise);
+    // Each AS originates its own prefix
+    r1.originate_route({"172.16.1.0", 24});
+    r4.originate_route({"172.16.2.0", 24});
+    r7.originate_route({"172.16.3.0", 24});
+    r9.originate_route({"172.16.4.0", 24});
 
-    // More ticks to allow propagation
-    for (int i = 0; i < 2; ++i) {
-        std::cout << "\n--- Tick " << i + 3 << " ---" << std::endl;
-        r1.tick();
-        r2.tick();
-        r3.tick();
+    // Run more ticks to allow routes to propagate across the network
+    for (int i = 0; i < 5; ++i) {
+        std::cout << "\n--- Tick " << i + 4 << " ---" << std::endl;
+        for(Router* r : all_routers) {
+            r->tick();
+        }
     }
 
-    // Print final routing tables
+    // Final routing tables to verify
     r1.print_routing_table();
-    r2.print_routing_table();
-    r3.print_routing_table();
+    r6.print_routing_table(); // Check this table to see if policy worked
+    r9.print_routing_table();
     
-    // Test IP packet forwarding 
-    IpPacket test_packet;
-    test_packet.source_ip = "5.5.5.5";
-    test_packet.destination_ip = "10.1.25.77"; // This IP is inside the 10.1.0.0/16 network
-    test_packet.payload = "Hello, World!";
+    // Packet forwarding test
 
-    r3.forward_packet(test_packet);
+    IpPacket test_packet;
+    test_packet.source_ip = "172.16.3.10"; // From AS 65003
+    test_packet.destination_ip = "172.16.1.50"; // To AS 65001
+    test_packet.payload = "BGP Policy Test!";
+
+    r7.forward_packet(test_packet);
 
     return 0;
 }
+}
 
-// Define the static member variable
 std::map<std::string, Router*> Router::network;
-
