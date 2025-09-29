@@ -8,11 +8,11 @@
 #include <fstream>
 #include <getopt.h>
 #include <sstream>
+#include <cstdint>
 
 struct IpPacket {
-    std::string destination_ip;
-    std::string source_ip;
-    std::string payload;
+    std::vector<bool> bits; // The entire packet as a sequence of bits
+    std::string payload; // The payload as a string
 };
 
 struct IpPrefix {
@@ -88,7 +88,7 @@ struct NotificationMessage : public Header {
 struct OpenMessage : public Header {
     OpenMessage() { type = MessageType::OPEN; }
     std::string router_id;
-    int as_number;
+    uint32_t as_number; // Changed to uint32_t to support 4-byte ASNs
 };
 
 struct UpdateMessage : public Header {
@@ -110,22 +110,22 @@ class Router;
 
 struct Peer {
     std::string peer_ip;
-    int peer_as;
+    uint32_t peer_as;
     SessionState state;
     Router* local_router;
 
-    Peer(const std::string& ip, int as, Router* router)
+    Peer(const std::string& ip, uint32_t as, Router* router)
         : peer_ip(ip), peer_as(as), state(SessionState::IDLE), local_router(router) {}
 };
 
 class Router {
 public:
     std::string router_id;
-    int as_number;
+    uint32_t as_number; // Changed to uint32_t to support 4-byte ASNs
     static std::map<std::string, Router*> network;
     std::vector<Policy> policies;
 
-    Router(const std::string& id, int as_num) : router_id_(id), as_number_(as_num), router_id(id), as_number(as_num) {
+    Router(const std::string& id, uint32_t as_num) : router_id_(id), as_number_(as_num), router_id(id), as_number(as_num) {
         network[id] = this;
     }
 
@@ -136,7 +136,7 @@ public:
     Router(Router&&) = default;
     Router& operator=(Router&&) = default;
 
-    void add_peer(const std::string& ip, int as) {
+    void add_peer(const std::string& ip, uint32_t as) {
         peers_.emplace(ip, Peer(ip, as, this));
     }
 
@@ -197,6 +197,92 @@ public:
         }
     }
 
+    static void construct_packet_bits(IpPacket& packet, const std::string& src_ip, const std::string& dest_ip, const std::string& payload) {
+        packet.bits.clear();
+        // Version (4 bits) + IHL (4 bits) -> 0x45 (IPv4, 5*4=20 byte header)
+        append_uint_to_bits(packet.bits, 0x45, 8);
+        // Differentiated Services Code Point (8 bits) - unused
+        append_uint_to_bits(packet.bits, 0, 8);
+        
+        // Total Length (16 bits) in bytes
+        uint16_t total_length = 20 + payload.length();
+        append_uint_to_bits(packet.bits, total_length, 16);
+
+        // Identification (16 bits) - unused
+        append_uint_to_bits(packet.bits, 0, 16);
+
+        // Flags (3 bits) + Fragment offset (13 bits) - unused
+        append_uint_to_bits(packet.bits, 0, 16);
+        
+        // TTL (8 bits) - set to a default of 64
+        append_uint_to_bits(packet.bits, 64, 8);
+        
+        // Protocol (8 bits) - unused for this simulation
+        append_uint_to_bits(packet.bits, 0, 8);
+
+        // Header Checksum (16 bits) - unused, set to 0
+        append_uint_to_bits(packet.bits, 0, 16);
+
+        // Source IP (32 bits)
+        std::vector<bool> src_ip_bits = ip_string_to_bits(src_ip);
+        packet.bits.insert(packet.bits.end(), src_ip_bits.begin(), src_ip_bits.end());
+
+        // Destination IP (32 bits)
+        std::vector<bool> dest_ip_bits = ip_string_to_bits(dest_ip);
+        packet.bits.insert(packet.bits.end(), dest_ip_bits.begin(), dest_ip_bits.end());
+        
+        // --- Payload ---
+        append_string_to_bits(packet.bits, payload);
+        
+        // Also store parsed values in the struct for convenience
+        packet.source_ip = src_ip;
+        packet.destination_ip = dest_ip;
+        packet.payload = payload;
+    }
+
+    /**
+     * Parses a packet's bit vector to extract header fields and payload.
+     * * @param packet is the IpPacket to parse. Its 'bits' vector is read, and the 
+     * source_ip, destination_ip, and payload fields are populated.
+     * @return true if parsing was successful, false otherwise.
+     */
+    static bool parse_packet(IpPacket& packet) {
+        if (packet.bits.size() < 160) { // Minimum header size is 20 bytes (160 bits)
+            return false;
+        }
+
+        // Version (bits 0-3), IHL (bits 4-7)
+        uint8_t version_ihl = bits_to_uint(packet.bits, 0, 8);
+        uint8_t version = version_ihl >> 4;
+        uint8_t ihl = version_ihl & 0x0F;
+        
+        if (version != 4 || ihl < 5) { // Checks for IPv4 and min header length
+            return false;
+        }
+        
+        // Total Length in bytes (bits 16-31)
+        uint16_t total_length_bytes = bits_to_uint(packet.bits, 16, 16);
+        
+        if (packet.bits.size() != total_length_bytes * 8) { // Integrity check
+            return false;
+        }
+        
+        size_t header_len_bits = ihl * 32;
+
+        // Source IP (bits 96-127)
+        packet.source_ip = bits_to_ip_string(packet.bits, 96);
+        
+        // Destination IP (bits 128-159)
+        packet.destination_ip = bits_to_ip_string(packet.bits, 128);
+        
+        // Payload
+        size_t payload_len_bytes = total_length_bytes - (header_len_bits / 8);
+        packet.payload = bits_to_string(packet.bits, header_len_bits, payload_len_bytes);
+        
+        return true;
+    }
+
+
     void forward_packet(const IpPacket& packet) {
         std::cout << "\nPacket arriving: " << router_id << ": Received packet for destination " << packet.destination_ip << std::endl; // The router receives a packet to forward
 
@@ -231,7 +317,7 @@ public:
             std::cout << "  " << prefix.network_address << "/" << prefix.prefix_length 
                       << " -> next-hop: " << route.next_hop_ip
                       << ", AS_PATH: [ ";
-            for(int as : route.as_path) {
+            for(uint32_t as : route.as_path) {
                 std::cout << as << " ";
             }
             std::cout << "]" << std::endl;
@@ -245,7 +331,7 @@ public:
 
 private:
     std::string router_id_;
-    int as_number_;
+    uint32_t as_number_;
     std::map<std::string, Peer> peers_; // Keyed by peer IP
     std::map<IpPrefix, Route> routing_table_; // for the routing table, each IpPrefix key represents a network prefix (address + length)
 
@@ -416,7 +502,7 @@ void load_topology(const std::string& filename, std::vector<Router*>& all_router
         if (current == ROUTERS) {
             // RouterID AS_Number
             std::string router_id = token;
-            int asn;
+            uint32_t asn;
             if (!(iss >> asn)) continue;
             auto* r = new Router(router_id, asn);
             all_routers.push_back(r);
@@ -427,8 +513,8 @@ void load_topology(const std::string& filename, std::vector<Router*>& all_router
             std::string router1 = token, router2;
             if (!(iss >> router2)) continue;
             // Add peers both ways
-            int as1 = router_as_map[router1];
-            int as2 = router_as_map[router2];
+            uint32_t as1 = router_as_map[router1];
+            uint32_t as2 = router_as_map[router2];
             if (Router::network.count(router1) && Router::network.count(router2)) {
                 Router::network[router1]->add_peer(router2, as2);
                 Router::network[router2]->add_peer(router1, as1);
