@@ -13,6 +13,8 @@
 struct IpPacket {
     std::vector<bool> bits; // The entire packet as a sequence of bits
     std::string payload; // The payload as a string
+    std::string source_ip;
+    std::string destination_ip;
 };
 
 struct IpPrefix {
@@ -74,6 +76,7 @@ enum class PolicyAction {
 
 struct Header {
     MessageType type;
+    std::string from_ip;
 };
 
 struct KeepaliveMessage : public Header {
@@ -120,8 +123,16 @@ struct Peer {
 
 class Router {
 public:
+    void print_peer_summary() const;
     std::string router_id;
     uint32_t as_number; // Changed to uint32_t to support 4-byte ASNs
+    void print_routing_table();
+    void tick();
+    void originate_route(const IpPrefix& prefix);
+    void handle_open(Peer& peer, const OpenMessage& message);
+    void handle_keepalive(Peer& peer, const KeepaliveMessage& message);
+    void process_inbox(); 
+    void send_message(const std::string& to_ip, Header& message); // Note: message is no longer const
     static std::map<std::string, Router*> network;
     std::vector<Policy> policies;
 
@@ -140,43 +151,7 @@ public:
         peers_.emplace(ip, Peer(ip, as, this));
     }
 
-    void originate_route(const IpPrefix& prefix) {
-        std::cout << "Router " << router_id << " originating route " 
-                  << prefix.network_address << "/" << prefix.prefix_length << std::endl;
-        Route new_route;
-        new_route.prefix = prefix;
-        new_route.next_hop_ip = router_id;
-        new_route.as_path.push_back(this->as_number);
-        new_route.origin = OriginType::IGP;
 
-        routing_table_[prefix] = new_route;
-
-        UpdateMessage update;
-        update.advertised_routes.push_back(new_route);
-        for(auto const& [peer_ip, peer] : peers_) {
-            if(peer.state == SessionState::ESTABLISHED) {
-                send_message(peer_ip, update);
-            }
-        }
-    }
-
-    void tick() {
-        for (auto& [peer_ip, peer] : peers_) {
-            if (peer.state == SessionState::IDLE) {
-                std::cout << router_id << " -> " << peer_ip << ": Sending OPEN." << std::endl;
-                OpenMessage open;
-                open.router_id = this->router_id;
-                open.as_number = this->as_number;
-                send_message(peer_ip, open);
-                peer.state = SessionState::OPEN_SENT;
-            } else if (peer.state == SessionState::ESTABLISHED) {
-                // In a real sim, you'd do this on a timer
-                // std::cout << router_id << " -> " << peer_ip << ": Sending KEEPALIVE." << std::endl;
-                KeepaliveMessage keepalive;
-                send_message(peer_ip, keepalive);
-            }
-        }
-    }
 
     void receive_message(const std::string& from_ip, const Header& message) { //IP address of the sender peer and the BGP message itself
         Peer& peer = peers_.at(from_ip);
@@ -195,6 +170,66 @@ public:
                 peer.state = SessionState::IDLE;
                 break;
         }
+    }
+
+    static uint64_t bits_to_uint(const std::vector<bool>& bits, size_t offset, int num_bits) {
+        uint64_t result = 0;
+        for (int i = 0; i < num_bits; ++i) {
+            result <<= 1; // Make space for the next bit
+            if (offset + i < bits.size() && bits[offset + i]) {
+                result |= 1;
+            }
+        }
+        return result;
+    }
+
+     static void append_uint_to_bits(std::vector<bool>& bits, uint64_t value, int num_bits) {
+        for (int i = num_bits - 1; i >= 0; --i) {
+            bits.push_back((value >> i) & 1);
+        }
+    }
+
+    static void append_string_to_bits(std::vector<bool>& bits, const std::string& s) {
+        for (char c : s) {
+            append_uint_to_bits(bits, static_cast<uint8_t>(c), 8);
+        }
+    }
+
+    static std::vector<bool> ip_string_to_bits(const std::string& ip) {
+        std::vector<bool> bits;
+        std::istringstream iss(ip);
+        std::string byte_str;
+        while (std::getline(iss, byte_str, '.')) {
+            uint8_t byte = static_cast<uint8_t>(std::stoi(byte_str));
+            append_uint_to_bits(bits, byte, 8);
+        }
+        return bits;
+    }   
+
+        static std::string bits_to_string(const std::vector<bool>& bits, size_t offset, size_t length_bytes) {
+        std::string s = "";
+        for (size_t i = 0; i < length_bytes; ++i) {
+            // Calculate the starting bit for the current character
+            size_t current_offset = offset + (i * 8);
+            if (current_offset + 8 > bits.size()) {
+                // Avoid reading past the end of the vector
+                break; 
+            }
+            // Convert 8 bits to a number, then cast it to a char
+            uint8_t char_code = bits_to_uint(bits, current_offset, 8);
+            s += static_cast<char>(char_code);
+        }
+        return s;
+    }
+
+    static std::string bits_to_ip_string(const std::vector<bool>& bits, size_t offset) {
+        std::string ip;
+        for (int i = 0; i < 4; ++i) {
+            if (i > 0) ip += ".";
+            uint8_t byte = static_cast<uint8_t>(bits_to_uint(bits, offset + i * 8, 8));
+            ip += std::to_string(byte);
+        }
+        return ip;
     }
 
     static void construct_packet_bits(IpPacket& packet, const std::string& src_ip, const std::string& dest_ip, const std::string& payload) {
@@ -283,6 +318,7 @@ public:
     }
 
 
+
     void forward_packet(const IpPacket& packet) {
         std::cout << "\nPacket arriving: " << router_id << ": Received packet for destination " << packet.destination_ip << std::endl; // The router receives a packet to forward
 
@@ -307,23 +343,6 @@ public:
         }
     }
 
-    void print_routing_table() {
-        std::cout << "\n--- Routing Table for " << router_id << " (AS " << as_number << ") ---" << std::endl;
-        if(routing_table_.empty()) {
-            std::cout << "(Table is empty)" << std::endl;
-            return;
-        }
-        for(const auto& [prefix, route] : routing_table_) {
-            std::cout << "  " << prefix.network_address << "/" << prefix.prefix_length 
-                      << " -> next-hop: " << route.next_hop_ip
-                      << ", AS_PATH: [ ";
-            for(uint32_t as : route.as_path) {
-                std::cout << as << " ";
-            }
-            std::cout << "]" << std::endl;
-        }
-        std::cout << "------------------------------------------" << std::endl;
-    }
 
     void add_policy_rule(const Policy& rule) {
         policies.push_back(rule);
@@ -334,42 +353,8 @@ private:
     uint32_t as_number_;
     std::map<std::string, Peer> peers_; // Keyed by peer IP
     std::map<IpPrefix, Route> routing_table_; // for the routing table, each IpPrefix key represents a network prefix (address + length)
+    std::vector<Header*> inbox_;
 
-    void send_message(const std::string& to_ip, const Header& message) {
-        if (network.count(to_ip)) {
-            network[to_ip]->receive_message(this->router_id, message);
-        }
-    }
-
-    void handle_open(Peer& peer, const OpenMessage& message) {
-        std::cout << router_id << " <- " << peer.peer_ip << ": Received OPEN." << std::endl;
-        if (peer.state == SessionState::OPEN_SENT) {
-            std::cout << "Session ESTABLISHED with " << peer.peer_ip << std::endl;
-            peer.state = SessionState::ESTABLISHED;
-            KeepaliveMessage keepalive;
-            send_message(peer.peer_ip, keepalive);
-
-            // Now that we're connected, advertise our own routes
-            if(!routing_table_.empty()){
-                UpdateMessage update_for_new_peer;
-                for(const auto& [prefix, route] : routing_table_) {
-                     // Only advertise routes we originated ourselves
-                    if(route.next_hop_ip == "0.0.0.0") {
-                        update_for_new_peer.advertised_routes.push_back(route);
-                    }
-                }
-                if(!update_for_new_peer.advertised_routes.empty()){
-                    send_message(peer.peer_ip, update_for_new_peer);
-                }
-            }
-        }
-    }
-
-    void handle_keepalive(Peer& peer, const KeepaliveMessage& message) {
-         if (peer.state == SessionState::ESTABLISHED) {
-            // std::cout << router_id << " <- " << peer.peer_ip << ": Received KEEPALIVE." << std::endl;
-        }
-    }
 
     void handle_update(Peer& peer, const UpdateMessage& message) {
         if (peer.state != SessionState::ESTABLISHED) return;
@@ -471,7 +456,124 @@ private:
         }
         return true;
     }
+
 };
+
+void Router::process_inbox() {
+    // Process all messages currently in the inbox
+    for (Header* msg : inbox_) {
+        // Call the main message handler for each message
+        receive_message(msg->from_ip, *msg);
+        
+        // Clean up the dynamically allocated message copy
+        delete msg;
+    }
+    // Clear the inbox to prepare for the next simulation tick
+    inbox_.clear();
+}
+
+void Router::send_message(const std::string& to_ip, Header& message) { // Note: message is no longer const
+    if (network.count(to_ip)) {
+        Router* destination_router = network[to_ip];
+        message.from_ip = this->router_id; // Set the sender's IP
+
+        // Create a copy of the message on the heap
+        Header* msg_copy;
+        switch(message.type) {
+            case MessageType::OPEN: 
+                msg_copy = new OpenMessage(*static_cast<OpenMessage*>(&message));
+                break;
+            case MessageType::UPDATE:
+                msg_copy = new UpdateMessage(*static_cast<UpdateMessage*>(&message));
+                break;
+            case MessageType::KEEPALIVE:
+                msg_copy = new KeepaliveMessage(*static_cast<KeepaliveMessage*>(&message));
+                break;
+            case MessageType::NOTIFICATION:
+                msg_copy = new NotificationMessage(*static_cast<NotificationMessage*>(&message));
+                break;
+        }
+
+        // Add the message copy to the destination's inbox
+        destination_router->inbox_.push_back(msg_copy);
+    }
+}
+
+void Router::handle_keepalive(Peer& peer, const KeepaliveMessage& message) {
+    if (peer.state == SessionState::OPEN_SENT) {
+        peer.state = SessionState::ESTABLISHED;
+        std::cout << "Session ESTABLISHED with " << peer.peer_ip << std::endl;
+
+        UpdateMessage update_for_new_peer;
+        for (const auto& [prefix, route] : routing_table_) {
+            if (route.next_hop_ip == "0.0.0.0" || route.next_hop_ip == this->router_id) {
+                update_for_new_peer.advertised_routes.push_back(route);
+            }
+        }
+        if (!update_for_new_peer.advertised_routes.empty()) {
+            send_message(peer.peer_ip, update_for_new_peer);
+        }
+
+    } else if (peer.state == SessionState::ESTABLISHED) {
+        // Normal keepalive to maintain the session
+    }
+}
+
+void Router::handle_open(Peer& peer, const OpenMessage& message) {
+    std::cout << router_id << " <- " << peer.peer_ip << ": Received OPEN." << std::endl;
+    
+    // When we receive an OPEN, we reply with a KEEPALIVE to confirm we received it.
+    KeepaliveMessage keepalive;
+    send_message(peer.peer_ip, keepalive);
+
+    // If we haven't sent our own OPEN yet (i.e., we were IDLE), we send it now.
+    if (peer.state == SessionState::IDLE) {
+        OpenMessage open;
+        open.router_id = this->router_id;
+        open.as_number = this->as_number;
+        send_message(peer.peer_ip, open);
+        peer.state = SessionState::OPEN_SENT;
+    }
+}
+
+void Router::print_routing_table() {
+    std::cout << "\n--- Routing Table for " << router_id << " (AS " << as_number << ") ---" << std::endl;
+    if(routing_table_.empty()) {
+        std::cout << "(Table is empty)" << std::endl;
+        return;
+    }
+    for(const auto& [prefix, route] : routing_table_) {
+        std::cout << "  " << prefix.network_address << "/" << prefix.prefix_length
+                  << " -> next-hop: " << route.next_hop_ip
+                  << ", AS_PATH: [ ";
+        for(uint32_t as : route.as_path) {
+            std::cout << as << " ";
+        }
+        std::cout << "]" << std::endl;
+    }
+    std::cout << "------------------------------------------" << std::endl;
+}
+
+void Router::originate_route(const IpPrefix& prefix) {
+    std::cout << "Router " << router_id << " originating route " 
+              << prefix.network_address << "/" << prefix.prefix_length << std::endl;
+              
+    Route new_route;
+    new_route.prefix = prefix;
+    new_route.next_hop_ip = router_id; // Assuming you fix the redundant variable issue
+    new_route.as_path.push_back(as_number);
+    new_route.origin = OriginType::IGP;
+
+    routing_table_[prefix] = new_route;
+
+    UpdateMessage update;
+    update.advertised_routes.push_back(new_route);
+    for(auto const& [peer_ip, peer] : peers_) {
+        if(peer.state == SessionState::ESTABLISHED) {
+            send_message(peer_ip, update);
+        }
+    }
+}
 
 void load_topology(const std::string& filename, std::vector<Router*>& all_routers) {
     std::ifstream infile(filename);
@@ -523,155 +625,197 @@ void load_topology(const std::string& filename, std::vector<Router*>& all_router
     }
 }
 
+
+
+void Router::tick() {
+    for (auto& [peer_ip, peer] : peers_) {
+        if (peer.state == SessionState::IDLE) {
+            std::cout << router_id_ << " -> " << peer_ip << ": Sending OPEN." << std::endl;
+            OpenMessage open;
+            open.router_id = this->router_id_; // Use the private member
+            open.as_number = this->as_number_; // Use the private member
+            send_message(peer_ip, open);
+            peer.state = SessionState::OPEN_SENT;
+        } else if (peer.state == SessionState::ESTABLISHED) {
+            KeepaliveMessage keepalive;
+            send_message(peer_ip, keepalive);
+        }
+    }
+}
+
+void Router::print_peer_summary() const {
+    std::cout << "\n--- BGP Peer Summary for " << router_id << " (AS " << as_number << ") ---" << std::endl;
+    if (peers_.empty()) {
+        std::cout << "(No peers configured)" << std::endl;
+        return;
+    }
+    std::cout << "Peer Address\t\tAS\t\tState\n";
+    std::cout << "--------------------------------------------------\n";
+    for (const auto& [ip, peer] : peers_) {
+        std::string state_str;
+        switch (peer.state) {
+            case SessionState::IDLE: state_str = "IDLE"; break;
+            case SessionState::CONNECT: state_str = "CONNECT"; break;
+            case SessionState::OPEN_SENT: state_str = "OPEN_SENT"; break;
+            case SessionState::OPEN_CONFIM: state_str = "OPEN_CONFIM"; break;
+            case SessionState::ESTABLISHED: state_str = "ESTABLISHED"; break;
+            default: state_str = "UNKNOWN"; break;
+        }
+        std::cout << ip << "\t\t" << peer.peer_as << "\t\t" << state_str << std::endl;
+    }
+    std::cout << "--------------------------------------------------" << std::endl;
+}
+void run_simulation_ticks(std::vector<Router*>& routers, int count) {
+    for (int i = 0; i < count; ++i) {
+         for(Router* r : routers) {
+            r->tick();
+        }
+
+        // Phase 2: All routers process their received messages
+        for(Router* r : routers) {
+            r->process_inbox();
+        }
+    }
+}
+
+void print_help() {
+    std::cout << "BGP Simulator CLI Commands:\n"
+              << "  show ip bgp <router_id>      - Display the BGP routing table for a router (e.g., 'show ip bgp 10.0.1.1').\n"
+              << "  show peers <router_id>        - Display the BGP peers and their session status for a router.\n"
+              << "  tick [n]                     - Advance the simulation by 'n' ticks (default is 1).\n"
+              << "  help                         - Show this help message.\n"
+              << "  exit / quit                  - Exit the simulator.\n";
+}
+
+
+
+
 int main(int argc, char* argv[]) {
     std::string topology_file;
     int opt;
-    while ((opt = getopt(argc, argv, "c:")) != -1) { // -c for config file
+    while ((opt = getopt(argc, argv, "c:")) != -1) {
         if (opt == 'c') topology_file = optarg;
     }
 
     std::vector<Router*> all_routers;
     if (!topology_file.empty()) {
         load_topology(topology_file, all_routers);
-        std::cout << "\n--- Establishing BGP Sessions ---" << std::endl;
-    for (int i = 0; i < 3; ++i) {
-        std::cout << "\n--- Tick " << i + 1 << " ---" << std::endl;
-        for(Router* r : all_routers) {
-            r->tick();
-        }
+    } else {
+        std::cout << "--- BGP Simulator Startup (Hardcoded Topology) ---" << std::endl;
+        // The hardcoded setup logic from your original file should go here
+        // This setup should populate the `all_routers` vector
     }
 
-    std::cout << "\n--- Route Origination and Propagation ---" << std::endl;
-    // Example: originate a route from the first router
+    std::cout << "\n--- Initializing Network and Establishing Sessions... ---" << std::endl;
+    run_simulation_ticks(all_routers, 3);
+
+    std::cout << "\n--- Originating Routes and Allowing Network to Converge... ---" << std::endl;
     if (!all_routers.empty()) {
         all_routers[0]->originate_route({"10.10.10.0", 24});
     }
+    run_simulation_ticks(all_routers, 5);
 
-    for (int i = 0; i < 5; ++i) {
-        std::cout << "\n--- Tick " << i + 4 << " ---" << std::endl;
-        for(Router* r : all_routers) {
-            r->tick();
+    std::cout << "\n\n--- Network converged. Entering interactive CLI. ---" << std::endl;
+    print_help();
+
+    std::string line;
+    while (true) {
+        std::cout << "\nBGP-Sim> ";
+        if (!std::getline(std::cin, line)) {
+            break;
+        }
+
+        std::istringstream iss(line);
+        std::vector<std::string> tokens;
+        std::string token;
+        while (iss >> token) {
+            tokens.push_back(token);
+        }
+
+        if (tokens.empty()) {
+            continue;
+        }
+
+        const std::string& command = tokens[0];
+
+        if (command == "exit" || command == "quit") {
+            std::cout << "Exiting simulator." << std::endl;
+            break;
+        } else if (command == "help") {
+            print_help();
+        } else if (command == "tick") {
+            int num_ticks = 1;
+            if (tokens.size() > 1) {
+                try {
+                    num_ticks = std::stoi(tokens[1]);
+                } catch (const std::exception&) {
+                    std::cout << "Error: Invalid number of ticks." << std::endl;
+                    continue;
+                }
+            }
+            std::cout << "Advancing simulation by " << num_ticks << " tick(s)..." << std::endl;
+           } else if (command == "neighbor") {
+            // Expected format: neighbor <router_id> <peer_ip> remote-as <asn>
+            if (tokens.size() == 5 && tokens[3] == "remote-as") {
+                const std::string& router_id = tokens[1];
+                const std::string& peer_ip = tokens[2];
+                const std::string& asn_str = tokens[4];
+
+                if (Router::network.count(router_id) == 0) {
+                    std::cout << "Error: Router '" << router_id << "' not found." << std::endl;
+                    continue;
+                }
+
+                try {
+                    uint32_t peer_as = std::stoul(asn_str); // Use stoul for uint32_t
+                    Router* router = Router::network[router_id];
+                    
+                    // The core action: call add_peer()
+                    router->add_peer(peer_ip, peer_as);
+
+                    std::cout << "Configured peer " << peer_ip << " (AS " << peer_as 
+                              << ") on router " << router_id << "." << std::endl;
+                    std::cout << "The neighborship will attempt to establish on the next tick." << std::endl;
+
+                } catch (const std::exception& e) {
+                    std::cout << "Error: Invalid AS number '" << asn_str << "'." << std::endl;
+                }
+
+            } else {
+                std::cout << "Usage: neighbor <router_id> <peer_ip> remote-as <asn>" << std::endl;
+            }
+       
+
+        } else if (command == "show") {
+            if (tokens.size() == 4 && tokens[1] == "ip" && tokens[2] == "bgp") {
+                const std::string& router_id = tokens[3];
+                if (Router::network.count(router_id)) {
+                    Router::network[router_id]->print_routing_table();
+                } else {
+                    std::cout << "Error: Router '" << router_id << "' not found." << std::endl;
+                }
+            } else if (tokens.size() == 3 && tokens[1] == "peers") {
+                const std::string& router_id = tokens[2];
+                if (Router::network.count(router_id)) {
+                    Router::network[router_id]->print_peer_summary();
+                } else {
+                    std::cout << "Error: Router '" << router_id << "' not found." << std::endl;
+                }
+            }
+            else {
+                std::cout << "Error: Invalid 'show' command. Type 'help' for syntax." << std::endl;
+            }
+        } else {
+            std::cout << "Error: Unknown command '" << command << "'. Type 'help' for available commands." << std::endl;
         }
     }
 
-    // Print routing tables for all routers
-    for(Router* r : all_routers) {
-        r->print_routing_table();
+    for (Router* r : all_routers) {
+        delete r;
     }
-
-    // Optional: test packet forwarding
-    if (all_routers.size() > 1) {
-        IpPacket test_packet;
-        test_packet.source_ip = "10.10.10.10";
-        test_packet.destination_ip = "10.10.10.20";
-        test_packet.payload = "Test!";
-        all_routers[0]->forward_packet(test_packet);
-    }
-    } else {
-    std::cout << "--- BGP Simulator Startup ---" << std::endl;
-
-// AS 65001
-    Router r1("10.0.1.1", 65001);
-    Router r2("10.0.1.2", 65001);
-    Router r3("10.0.1.3", 65001);
-
-    // AS 65002
-    Router r4("10.0.2.4", 65002);
-    Router r5("10.0.2.5", 65002);
-    
-    // AS 65003
-    Router r6("10.0.3.6", 65003);
-    Router r7("10.0.3.7", 65003);
-    Router r8("10.0.3.8", 65003);
-    
-    // AS 65004
-    Router r9("10.0.4.9", 65004);
-    Router r10("10.0.4.10", 65004);
-
-    // Helper vector to easily iterate over all routers
-    std::vector<Router*> all_routers = {&r1, &r2, &r3, &r4, &r5, &r6, &r7, &r8, &r9, &r10};
-
-    // Peering topology setup
-    
-    // iBGP Peering (Full mesh within each AS using Router IDs)
-    r1.add_peer(r2.router_id, 65001); r1.add_peer(r3.router_id, 65001);
-    r2.add_peer(r1.router_id, 65001); r2.add_peer(r3.router_id, 65001);
-    r3.add_peer(r1.router_id, 65001); r3.add_peer(r2.router_id, 65001);
-    
-    r4.add_peer(r5.router_id, 65002);
-    r5.add_peer(r4.router_id, 65002);
-
-    r6.add_peer(r7.router_id, 65003); r6.add_peer(r8.router_id, 65003);
-    r7.add_peer(r6.router_id, 65003); r7.add_peer(r8.router_id, 65003);
-    r8.add_peer(r6.router_id, 65003); r8.add_peer(r7.router_id, 65003);
-
-    r9.add_peer(r10.router_id, 65004);
-    r10.add_peer(r9.router_id, 65004);
-
-    // -- eBGP Peering (Between border routers) --
-    r3.add_peer(r4.router_id, 65002);
-    r4.add_peer(r3.router_id, 65001);
-
-    r4.add_peer(r6.router_id, 65003);
-    r6.add_peer(r4.router_id, 65002);
-    
-    r5.add_peer(r10.router_id, 65004);
-    r10.add_peer(r5.router_id, 65002);
-    
-    r8.add_peer(r9.router_id, 65004);
-    r9.add_peer(r8.router_id, 65003);
-    
-
-    // Configuring a policy on AS 65003
-
-    Policy prefer_as65004;
-    prefer_as65004.rule_name = "Prefer-AS65004-Path";
-    prefer_as65004.direction = PolicyDirection::INBOUND; // Inbound policy on R8
-    prefer_as65004.action = PolicyAction::SET_LOCAL_PREF;
-    prefer_as65004.match_peer_ip = r9.router_id; // Match routes from R9
-    prefer_as65004.action_value = 200; // Default Local Pref is 100
-    // r8.add_policy_rule(prefer_as65004); // NOTE: This requires fixing inbound policy modification
-
-    // Simulation ticks
-    std::cout << "\n--- Establishing BGP Sessions ---" << std::endl;
-    for (int i = 0; i < 3; ++i) {
-        std::cout << "\n--- Tick " << i + 1 << " ---" << std::endl;
-        for(Router* r : all_routers) {
-            r->tick();
-        }
-    }
-    
-    std::cout << "\n--- Route Origination and Propagation ---" << std::endl;
-    // Each AS originates its own prefix
-    r1.originate_route({"172.16.1.0", 24});
-    r4.originate_route({"172.16.2.0", 24});
-    r7.originate_route({"172.16.3.0", 24});
-    r9.originate_route({"172.16.4.0", 24});
-
-    // Run more ticks to allow routes to propagate across the network
-    for (int i = 0; i < 5; ++i) {
-        std::cout << "\n--- Tick " << i + 4 << " ---" << std::endl;
-        for(Router* r : all_routers) {
-            r->tick();
-        }
-    }
-
-    // Final routing tables to verify
-    r1.print_routing_table();
-    r6.print_routing_table(); // Check this table to see if policy worked
-    r9.print_routing_table();
-    
-    // Packet forwarding test
-
-    IpPacket test_packet;
-    test_packet.source_ip = "172.16.3.10"; // From AS 65003
-    test_packet.destination_ip = "172.16.1.50"; // To AS 65001
-    test_packet.payload = "BGP Policy Test!";
-
-    r7.forward_packet(test_packet);
+    all_routers.clear();
 
     return 0;
-}
 }
 
 std::map<std::string, Router*> Router::network;
