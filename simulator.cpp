@@ -9,6 +9,7 @@
 #include <getopt.h>
 #include <sstream>
 #include <cstdint>
+#include <iomanip>
 
 struct IpPacket {
     std::vector<bool> bits; // The entire packet as a sequence of bits
@@ -59,7 +60,8 @@ enum class MessageType {
     OPEN = 1,
     UPDATE = 2,
     NOTIFICATION = 3,
-    KEEPALIVE = 4
+    KEEPALIVE = 4,
+    TRUST_MESSAGE = 5 // New message type for trust data exchange
 };
 
 enum class PolicyDirection {
@@ -109,6 +111,11 @@ struct Policy {
     int action_value;
 };
 
+struct TrustMessage : public Header {
+    TrustMessage() { type = MessageType::TRUST_MESSAGE; }
+    std::map<std::string, double> trust_data; // Key: Router ID, Value: Trust value (0.0 to 1.0)
+};
+
 class Router;
 
 struct Peer {
@@ -116,6 +123,9 @@ struct Peer {
     uint32_t peer_as;
     SessionState state;
     Router* local_router;
+
+    int successful_interactions = 0;
+    int total_interactions = 0;
 
     Peer(const std::string& ip, uint32_t as, Router* router)
         : peer_ip(ip), peer_as(as), state(SessionState::IDLE), local_router(router) {}
@@ -136,9 +146,14 @@ public:
     static std::map<std::string, Router*> network;
     std::vector<Policy> policies;
 
+     void print_trust_table() const;
+
     Router(const std::string& id, uint32_t as_num) : router_id_(id), as_number_(as_num), router_id(id), as_number(as_num) {
         network[id] = this;
+        // A router always fully trusts itself
+        total_trust_values_[router_id_] = 1.0;
     }
+
 
     ~Router() = default;
     
@@ -167,7 +182,14 @@ public:
                 break;
             case MessageType::NOTIFICATION:
                  std::cout << router_id << " <- " << peer.peer_ip << ": Received NOTIFICATION. Tearing down session." << std::endl;
+                 if (total_trust_values_.count(peer.peer_ip)) {
+                    total_trust_values_[peer.peer_ip] /= 2.0; // Severe penalty
+                }
                 peer.state = SessionState::IDLE;
+                break;
+                // Handle trust messages if implemented
+                case MessageType::TRUST_MESSAGE:
+                handle_trust_message(peer, static_cast<const TrustMessage&>(message));
                 break;
         }
     }
@@ -354,7 +376,93 @@ private:
     std::map<std::string, Peer> peers_; // Keyed by peer IP
     std::map<IpPrefix, Route> routing_table_; // for the routing table, each IpPrefix key represents a network prefix (address + length)
     std::vector<Header*> inbox_;
+    int tick_counter_ = 0; // For periodic tasks
 
+    // Trust-related data members
+    const double DIRECT_TRUST_WEIGHT = 0.6;
+    const double VOTED_TRUST_WEIGHT = 0.4;
+    const double DEFAULT_TRUST = 0.5;
+
+    std::map<std::string, double> direct_trust_values_; // Direct trust values for each peer
+    std::map<std::string, double> voted_trust_values_;  // Voted trust values
+    std::map<std::string, double> total_trust_values_;  // Total trust values
+
+    // Key: Peer IP, Value: The trust map that peer sent us
+    std::map<std::string, std::map<std::string, double>> received_trust_data_;
+
+    double get_trust(const std::string& router_id) {
+        if (total_trust_values_.count(router_id)) {
+            return total_trust_values_.at(router_id);
+        }
+        return DEFAULT_TRUST;
+    }
+
+    /**
+     * @brief Handles an incoming TrustMessage, caching the data.
+     */
+    void handle_trust_message(Peer& peer, const TrustMessage& message) {
+        // std::cout << router_id_ << " <- " << peer.peer_ip << ": Received TRUST_MESSAGE." << std::endl;
+        received_trust_data_[peer.peer_ip] = message.trust_data;
+    }
+
+    /**
+     * @brief The core trust calculation logic.
+     * This method iterates through all peers, calculates direct and voted trust,
+     * and updates the total_trust_values_ map.
+     */
+    void calculate_and_update_trust() {
+        for (auto& [target_peer_ip, target_peer] : peers_) {
+            // 1. Calculate Direct Trust
+            double direct_trust = DEFAULT_TRUST;
+            if (target_peer.total_interactions > 0) {
+                direct_trust = static_cast<double>(target_peer.successful_interactions) / target_peer.total_interactions;
+            }
+            
+            // 2. Calculate Voted Trust
+            double total_weighted_vote = 0.0;
+            double total_weight = 0.0;
+
+            // Ask our *other* neighbors for their opinion on the target peer
+            for (auto const& [voter_peer_ip, voter_peer] : peers_) {
+                if (voter_peer_ip == target_peer_ip) continue; // Don't ask a peer about themselves
+
+                // How much do we trust the voter? This is the weight.
+                double voter_trust = get_trust(voter_peer_ip);
+
+                // What is the voter's opinion of the target? This is the vote.
+                double vote = DEFAULT_TRUST;
+                if (received_trust_data_.count(voter_peer_ip) && received_trust_data_[voter_peer_ip].count(target_peer_ip)) {
+                    vote = received_trust_data_[voter_peer_ip][target_peer_ip];
+                }
+                
+                total_weighted_vote += vote * voter_trust;
+                total_weight += voter_trust;
+            }
+
+            double voted_trust = (total_weight > 0) ? (total_weighted_vote / total_weight) : DEFAULT_TRUST;
+
+            // 3. Combine them into Total Trust
+            double total_trust = (DIRECT_TRUST_WEIGHT * direct_trust) + (VOTED_TRUST_WEIGHT * voted_trust);
+            // Clamp value between 0 and 1
+            total_trust = std::max(0.0, std::min(1.0, total_trust)); 
+            
+            total_trust_values_[target_peer_ip] = total_trust;
+        }
+    }
+
+    /**
+     * @brief Broadcasts this router's trust table to all established peers.
+     */
+    void send_trust_updates() {
+        TrustMessage msg;
+        msg.trust_data = this->total_trust_values_;
+        
+        for (auto const& [peer_ip, peer] : peers_) {
+            if (peer.state == SessionState::ESTABLISHED) {
+                send_message(peer_ip, msg);
+            }
+        }
+    }
 
     void handle_update(Peer& peer, const UpdateMessage& message) {
         if (peer.state != SessionState::ESTABLISHED) return;
@@ -374,25 +482,28 @@ private:
 
 
             // BGP decision process
+              double next_hop_trust = get_trust(candidate_route.next_hop_ip);
+            double effective_local_pref = candidate_route.local_pref * next_hop_trust;
+
             if (routing_table_.count(candidate_route.prefix) == 0) {
-                // If we have no route, we accept this one
-              routing_table_[candidate_route.prefix] = candidate_route;
-            table_changed = true;
-        } else {
-            Route& existing_route = routing_table_.at(candidate_route.prefix);
-            // Higher LOCAL_PREF is better
-            if (candidate_route.local_pref > existing_route.local_pref) {
-                existing_route = candidate_route;
+                routing_table_[candidate_route.prefix] = candidate_route;
                 table_changed = true;
-            } 
-            // Shorter AS_PATH is better (only if LOCAL_PREF is equal)
-            else if (candidate_route.local_pref == existing_route.local_pref &&
-                       candidate_route.as_path.size() < existing_route.as_path.size()) {
-                existing_route = candidate_route;
-                table_changed = true;
+            } else {
+                Route& existing_route = routing_table_.at(candidate_route.prefix);
+                double existing_route_trust = get_trust(existing_route.next_hop_ip);
+                double existing_effective_local_pref = existing_route.local_pref * existing_route_trust;
+
+                // Compare based on trust-adjusted Local Pref
+                if (effective_local_pref > existing_effective_local_pref) {
+                    existing_route = candidate_route;
+                    table_changed = true;
+                } else if (effective_local_pref == existing_effective_local_pref &&
+                           candidate_route.as_path.size() < existing_route.as_path.size()) {
+                    existing_route = candidate_route;
+                    table_changed = true;
+                }
             }
         }
-    }
 
         if (table_changed) {
             std::cout << "   " << router_id << "'s routing table changed. Propagating updates." << std::endl;
@@ -479,7 +590,7 @@ void Router::send_message(const std::string& to_ip, Header& message) { // Note: 
 
         // Create a copy of the message on the heap
         Header* msg_copy;
-        switch(message.type) {
+     switch(message.type) {
             case MessageType::OPEN: 
                 msg_copy = new OpenMessage(*static_cast<OpenMessage*>(&message));
                 break;
@@ -492,6 +603,9 @@ void Router::send_message(const std::string& to_ip, Header& message) { // Note: 
             case MessageType::NOTIFICATION:
                 msg_copy = new NotificationMessage(*static_cast<NotificationMessage*>(&message));
                 break;
+            case MessageType::TRUST_MESSAGE:  // ADD THIS CASE
+                msg_copy = new TrustMessage(*static_cast<TrustMessage*>(&message));
+                break;
         }
 
         // Add the message copy to the destination's inbox
@@ -500,10 +614,11 @@ void Router::send_message(const std::string& to_ip, Header& message) { // Note: 
 }
 
 void Router::handle_keepalive(Peer& peer, const KeepaliveMessage& message) {
+    peer.successful_interactions++;
+
     if (peer.state == SessionState::OPEN_SENT) {
         peer.state = SessionState::ESTABLISHED;
         std::cout << "Session ESTABLISHED with " << peer.peer_ip << std::endl;
-
         UpdateMessage update_for_new_peer;
         for (const auto& [prefix, route] : routing_table_) {
             if (route.next_hop_ip == "0.0.0.0" || route.next_hop_ip == this->router_id) {
@@ -513,9 +628,6 @@ void Router::handle_keepalive(Peer& peer, const KeepaliveMessage& message) {
         if (!update_for_new_peer.advertised_routes.empty()) {
             send_message(peer.peer_ip, update_for_new_peer);
         }
-
-    } else if (peer.state == SessionState::ESTABLISHED) {
-        // Normal keepalive to maintain the session
     }
 }
 
@@ -542,16 +654,20 @@ void Router::print_routing_table() {
         std::cout << "(Table is empty)" << std::endl;
         return;
     }
+    std::cout << "Prefix\t\t\tNext Hop\t\tTrust\tAS_PATH" << std::endl;
+    std::cout << "-----------------------------------------------------------------------" << std::endl;
     for(const auto& [prefix, route] : routing_table_) {
-        std::cout << "  " << prefix.network_address << "/" << prefix.prefix_length
-                  << " -> next-hop: " << route.next_hop_ip
-                  << ", AS_PATH: [ ";
+        double trust = get_trust(route.next_hop_ip);
+        std::cout << std::left << std::setw(24) << (prefix.network_address + "/" + std::to_string(prefix.prefix_length))
+                  << std::setw(24) << route.next_hop_ip
+                  << std::fixed << std::setprecision(3) << std::setw(8) << trust
+                  << "[ ";
         for(uint32_t as : route.as_path) {
             std::cout << as << " ";
         }
         std::cout << "]" << std::endl;
     }
-    std::cout << "------------------------------------------" << std::endl;
+    std::cout << "-----------------------------------------------------------------------" << std::endl;
 }
 
 void Router::originate_route(const IpPrefix& prefix) {
@@ -629,11 +745,13 @@ void load_topology(const std::string& filename, std::vector<Router*>& all_router
 
 void Router::tick() {
     for (auto& [peer_ip, peer] : peers_) {
+        peer.total_interactions++;
+
         if (peer.state == SessionState::IDLE) {
             std::cout << router_id_ << " -> " << peer_ip << ": Sending OPEN." << std::endl;
             OpenMessage open;
-            open.router_id = this->router_id_; // Use the private member
-            open.as_number = this->as_number_; // Use the private member
+            open.router_id = this->router_id_;
+            open.as_number = this->as_number_;
             send_message(peer_ip, open);
             peer.state = SessionState::OPEN_SENT;
         } else if (peer.state == SessionState::ESTABLISHED) {
@@ -641,6 +759,28 @@ void Router::tick() {
             send_message(peer_ip, keepalive);
         }
     }
+
+    // Periodically run trust protocol
+    if (tick_counter_ % 5 == 0) { // Every 5 ticks
+        // std::cout << router_id_ << ": Calculating trust and sending updates." << std::endl;
+        calculate_and_update_trust();
+        send_trust_updates();
+    }
+}
+
+void Router::print_trust_table() const {
+    std::cout << "\n--- Trust Table for " << router_id << " (AS " << as_number << ") ---" << std::endl;
+    if (total_trust_values_.empty()) {
+        std::cout << "(Table is empty)" << std::endl;
+        return;
+    }
+    std::cout << "Target Router\t\tTotal Trust" << std::endl;
+    std::cout << "------------------------------------------" << std::endl;
+    for (const auto& [target_ip, trust_value] : total_trust_values_) {
+        std::cout << std::left << std::setw(24) << target_ip
+                  << std::fixed << std::setprecision(4) << trust_value << std::endl;
+    }
+    std::cout << "------------------------------------------" << std::endl;
 }
 
 void Router::print_peer_summary() const {
@@ -665,29 +805,33 @@ void Router::print_peer_summary() const {
     }
     std::cout << "--------------------------------------------------" << std::endl;
 }
+
+
+void print_help() {
+    std::cout << "BGP Simulator CLI Commands:\n"
+              << "  show ip bgp <router_id>      - Display the BGP routing table for a router.\n"
+              << "  show peers <router_id>        - Display the BGP peers and their session status.\n"
+              << "  show trust <router_id>        - Display the trust table for a router.\n"
+              << "  tick [n]                     - Advance the simulation by 'n' ticks (default is 1).\n"
+              << "  neighbor <r_id> <p_ip> remote-as <asn> - Configure a new peer.\n"
+              << "  help                         - Show this help message.\n"
+              << "  exit / quit                  - Exit the simulator.\n";
+}
+
+// This helper function is called by main() to advance the simulation.
 void run_simulation_ticks(std::vector<Router*>& routers, int count) {
     for (int i = 0; i < count; ++i) {
+         // Phase 1: All routers perform their periodic actions (send messages)
          for(Router* r : routers) {
             r->tick();
         }
 
-        // Phase 2: All routers process their received messages
+        // All routers process their received messages
         for(Router* r : routers) {
             r->process_inbox();
         }
     }
 }
-
-void print_help() {
-    std::cout << "BGP Simulator CLI Commands:\n"
-              << "  show ip bgp <router_id>      - Display the BGP routing table for a router (e.g., 'show ip bgp 10.0.1.1').\n"
-              << "  show peers <router_id>        - Display the BGP peers and their session status for a router.\n"
-              << "  tick [n]                     - Advance the simulation by 'n' ticks (default is 1).\n"
-              << "  help                         - Show this help message.\n"
-              << "  exit / quit                  - Exit the simulator.\n";
-}
-
-
 
 
 int main(int argc, char* argv[]) {
@@ -702,7 +846,6 @@ int main(int argc, char* argv[]) {
         load_topology(topology_file, all_routers);
     } else {
         std::cout << "--- BGP Simulator Startup (Hardcoded Topology) ---" << std::endl;
-        // The hardcoded setup logic from your original file should go here
         // This setup should populate the `all_routers` vector
     }
 
@@ -713,7 +856,10 @@ int main(int argc, char* argv[]) {
     if (!all_routers.empty()) {
         all_routers[0]->originate_route({"10.10.10.0", 24});
     }
-    run_simulation_ticks(all_routers, 5);
+    
+    // <<< running more ticks to allow trust protocol to converge >>>
+    std::cout << "\n--- Allowing Trust Protocol to Propagate... ---" << std::endl;
+    run_simulation_ticks(all_routers, 10);
 
     std::cout << "\n\n--- Network converged. Entering interactive CLI. ---" << std::endl;
     print_help();
@@ -722,7 +868,7 @@ int main(int argc, char* argv[]) {
     while (true) {
         std::cout << "\nBGP-Sim> ";
         if (!std::getline(std::cin, line)) {
-            break;
+            break; // Handle EOF (Ctrl+D)
         }
 
         std::istringstream iss(line);
@@ -754,8 +900,10 @@ int main(int argc, char* argv[]) {
                 }
             }
             std::cout << "Advancing simulation by " << num_ticks << " tick(s)..." << std::endl;
-           } else if (command == "neighbor") {
-            // Expected format: neighbor <router_id> <peer_ip> remote-as <asn>
+            // run the simulation ticks >>>
+            run_simulation_ticks(all_routers, num_ticks);
+
+        } else if (command == "neighbor") {
             if (tokens.size() == 5 && tokens[3] == "remote-as") {
                 const std::string& router_id = tokens[1];
                 const std::string& peer_ip = tokens[2];
@@ -767,10 +915,8 @@ int main(int argc, char* argv[]) {
                 }
 
                 try {
-                    uint32_t peer_as = std::stoul(asn_str); // Use stoul for uint32_t
+                    uint32_t peer_as = std::stoul(asn_str);
                     Router* router = Router::network[router_id];
-                    
-                    // The core action: call add_peer()
                     router->add_peer(peer_ip, peer_as);
 
                     std::cout << "Configured peer " << peer_ip << " (AS " << peer_as 
@@ -780,13 +926,11 @@ int main(int argc, char* argv[]) {
                 } catch (const std::exception& e) {
                     std::cout << "Error: Invalid AS number '" << asn_str << "'." << std::endl;
                 }
-
             } else {
                 std::cout << "Usage: neighbor <router_id> <peer_ip> remote-as <asn>" << std::endl;
             }
-       
-
         } else if (command == "show") {
+            // 'show ip bgp <router_id>'
             if (tokens.size() == 4 && tokens[1] == "ip" && tokens[2] == "bgp") {
                 const std::string& router_id = tokens[3];
                 if (Router::network.count(router_id)) {
@@ -794,10 +938,19 @@ int main(int argc, char* argv[]) {
                 } else {
                     std::cout << "Error: Router '" << router_id << "' not found." << std::endl;
                 }
+            // 'show peers <router_id>'
             } else if (tokens.size() == 3 && tokens[1] == "peers") {
                 const std::string& router_id = tokens[2];
                 if (Router::network.count(router_id)) {
                     Router::network[router_id]->print_peer_summary();
+                } else {
+                    std::cout << "Error: Router '" << router_id << "' not found." << std::endl;
+                }
+            // 'show trust <router_id>' command >>>
+            } else if (tokens.size() == 3 && tokens[1] == "trust") {
+                const std::string& router_id = tokens[2];
+                if (Router::network.count(router_id)) {
+                    Router::network[router_id]->print_trust_table();
                 } else {
                     std::cout << "Error: Router '" << router_id << "' not found." << std::endl;
                 }
@@ -810,6 +963,7 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    // Cleanup
     for (Router* r : all_routers) {
         delete r;
     }
