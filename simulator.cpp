@@ -761,7 +761,6 @@ void Router::print_peer_summary() const {
 
 void print_help() {
     std::cout << "BGP Simulator CLI Commands:\n"
-<<<<<<< HEAD
               << "  show ip bgp <router_id>            - Display the BGP routing table for a router.\n"
               << "  show peers <router_id>             - Display the BGP peers and their session status.\n"
               << "  show trust <router_id>             - Display the trust table for a router.\n"
@@ -772,15 +771,6 @@ void print_help() {
               << "  withdraw <r_id> <prefix/len>     - Withdraw route from its original source.\n"
               << "  help                             - Show this help message.\n"
               << "  exit / quit                        - Exit the simulator.\n";
-=======
-              << "  show ip bgp <router_id>      - Display the BGP routing table for a router.\n"
-              << "  show peers <router_id>        - Display the BGP peers and their session status.\n"
-              << "  show trust <router_id>        - Display the trust table for a router.\n"
-              << "  tick [n]                      - Advance the simulation by 'n' ticks (default is 1).\n"
-              << "  neighbor <r_id> <p_ip> remote-as <asn> - Configure a new peer.\n"
-              << "  help                          - Show this help message.\n"
-              << "  exit / quit                   - Exit the simulator.\n";
->>>>>>> eb8f229b2780b583dc931ac0fe966c88ff472ffd
 }
 
 // --- CHANGE: Added verbose parameter with default value ---
@@ -810,10 +800,7 @@ int main(int argc, char* argv[]) {
     }
 
     std::cout << "\n--- Initializing Network and Establishing Sessions... ---" << std::endl;
-<<<<<<< HEAD
-=======
     // --- CHANGE: Run silently ---
->>>>>>> eb8f229b2780b583dc931ac0fe966c88ff472ffd
     run_simulation_ticks(all_routers, 3, false);
     std::cout << "Done." << std::endl;
 
@@ -823,10 +810,7 @@ int main(int argc, char* argv[]) {
     }
     
     std::cout << "\n--- Allowing Trust Protocol to Propagate... ---" << std::endl;
-<<<<<<< HEAD
-=======
     // --- CHANGE: Run silently ---
->>>>>>> eb8f229b2780b583dc931ac0fe966c88ff472ffd
     run_simulation_ticks(all_routers, 10, false);
     std::cout << "Done." << std::endl;
 
@@ -869,10 +853,6 @@ int main(int argc, char* argv[]) {
                 }
             }
             std::cout << "Advancing simulation by " << num_ticks << " tick(s)..." << std::endl;
-<<<<<<< HEAD
-=======
-            // --- CHANGE: Run verbosely from CLI ---
->>>>>>> eb8f229b2780b583dc931ac0fe966c88ff472ffd
             run_simulation_ticks(all_routers, num_ticks, true);
 
         } else if (command == "neighbor") {
