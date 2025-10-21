@@ -1,0 +1,15 @@
+# Executables
+*.exe
+*.out
+*.app
+
+# Object files
+*.o
+*.obj
+
+# Build directories (optional, but good practice)
+build/
+bin/
+
+# VS Code specific files
+.vscode/
