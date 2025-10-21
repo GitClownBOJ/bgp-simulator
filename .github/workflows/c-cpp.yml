@@ -8,16 +8,14 @@ on:
 
 jobs:
   build:
-
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v4
-    - name: configure
-      run: ./configure
-    - name: make
-      run: make
-    - name: make check
-      run: make check
-    - name: make distcheck
-      run: make distcheck
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Compile the code
+      run: g++ simulator.cpp -o bgp_sim -std=c++17 -Wall
+
+    - name: (Optional) Run the executable to test
+      run: ./bgp_sim -c topology.conf
