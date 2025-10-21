@@ -133,12 +133,11 @@ struct Peer {
 
 class Router {
 public:
-    // --- CHANGE: Added public getters ---
+
     const std::string& get_router_id() const { return router_id_; }
     uint32_t get_as_number() const { return as_number_; }
 
     void print_peer_summary() const;
-    // --- CHANGE: Redundant public members removed ---
     void print_routing_table();
     void tick(bool verbose);
     void originate_route(const IpPrefix& prefix, bool verbose = true);
@@ -146,12 +145,13 @@ public:
     void handle_keepalive(Peer& peer, const KeepaliveMessage& message, bool verbose);
     void process_inbox(bool verbose); 
     void send_message(const std::string& to_ip, Header& message);
+    bool is_active() const { return is_active_; }
     static std::map<std::string, Router*> network;
     std::vector<Policy> policies;
 
     void print_trust_table() const;
 
-    // --- CHANGE: Constructor fixed ---
+
     Router(const std::string& id, uint32_t as_num) : router_id_(id), as_number_(as_num) {
         network[id] = this;
         total_trust_values_[router_id_] = 1.0;
@@ -166,6 +166,26 @@ public:
 
     void add_peer(const std::string& ip, uint32_t as) {
         peers_.emplace(ip, Peer(ip, as, this));
+    }
+
+    void shutdown() {
+        std::cout << "Shutting down router " << router_id_ << "." << std::endl;
+        is_active_ = false;
+        
+        // Tear down all active BGP sessions
+        for (auto& [peer_ip, peer] : peers_) {
+            if (peer.state == SessionState::ESTABLISHED) {
+                NotificationMessage notification;
+                send_message(peer_ip, notification); // Inform peer of shutdown
+                peer.state = SessionState::IDLE;
+            }
+        }
+    }
+
+    void startup() {
+        std::cout << "Starting up router " << router_id_ << "." << std::endl;
+        is_active_ = true;
+        // The tick() method will automatically begin re-establishing sessions.
     }
 
     void receive_message(const std::string& from_ip, const Header& message, bool verbose) {
@@ -190,14 +210,34 @@ public:
                 handle_keepalive(peer, static_cast<const KeepaliveMessage&>(message), verbose);
                 break;
             case MessageType::NOTIFICATION:
-                if (verbose) {
-                    std::cout << router_id_ << " <- " << peer.peer_ip << ": Received NOTIFICATION. Tearing down session." << std::endl;
+            if (verbose) {
+                std::cout << router_id_ << " <- " << peer.peer_ip << ": Received NOTIFICATION. Tearing down session." << std::endl;
+            }
+            if (total_trust_values_.count(peer.peer_ip)) {
+                total_trust_values_[peer.peer_ip] /= 2.0;
+            }
+            peer.state = SessionState::IDLE;
+
+            // Remove all routes learned from this peer ---
+            {
+                std::vector<IpPrefix> prefixes_to_remove;
+                for (const auto& [prefix, route] : routing_table_) {
+                    if (route.next_hop_ip == peer.peer_ip) {
+                        prefixes_to_remove.push_back(prefix);
+                    }
                 }
-                if (total_trust_values_.count(peer.peer_ip)) {
-                    total_trust_values_[peer.peer_ip] /= 2.0;
+
+                if (!prefixes_to_remove.empty()) {
+                    if (verbose) {
+                        std::cout << "    " << router_id_ << ": Removing " << prefixes_to_remove.size() << " stale route(s) from peer " << peer.peer_ip << "." << std::endl;
+                    }
+                    for (const auto& prefix : prefixes_to_remove) {
+                        routing_table_.erase(prefix);
+                    }
+                    // For this project, simply removing the routes is sufficient.
                 }
-                peer.state = SessionState::IDLE;
-                break;
+            }
+            break;
             case MessageType::TRUST_MESSAGE:
                 handle_trust_message(peer, static_cast<const TrustMessage&>(message));
                 break;
@@ -374,6 +414,7 @@ private:
     std::map<IpPrefix, Route> routing_table_;
     std::vector<Header*> inbox_;
     int tick_counter_ = 0;
+    bool is_active_ = true;
 
     const double DIRECT_TRUST_WEIGHT = 0.6;
     const double VOTED_TRUST_WEIGHT = 0.4;
@@ -552,6 +593,9 @@ private:
 };
 
 void Router::process_inbox(bool verbose) {
+    if (!is_active_) {
+        return; // Don't process messages if shut down
+    }
     for (Header* msg : inbox_) {
         receive_message(msg->from_ip, *msg, verbose);
         delete msg;
@@ -590,18 +634,24 @@ void Router::send_message(const std::string& to_ip, Header& message) {
 
 void Router::handle_keepalive(Peer& peer, const KeepaliveMessage& message, bool verbose) {
     peer.successful_interactions++;
-    if (peer.state == SessionState::OPEN_SENT) {
+if (peer.state == SessionState::OPEN_SENT) {
         peer.state = SessionState::ESTABLISHED;
         if (verbose) {
             std::cout << "Session ESTABLISHED with " << peer.peer_ip << std::endl;
         }
+        // Send the entire routing table to the new peer.
         UpdateMessage update_for_new_peer;
         for (const auto& [prefix, route] : routing_table_) {
-            if (route.next_hop_ip == "0.0.0.0" || route.next_hop_ip == this->router_id_) {
-                update_for_new_peer.advertised_routes.push_back(route);
-            }
+            // it will advertise ALL best paths, not just self-originated ones.
+            update_for_new_peer.advertised_routes.push_back(route);
         }
+        
         if (!update_for_new_peer.advertised_routes.empty()) {
+            if (verbose) {
+                 std::cout << "    " << router_id_ << " -> " << peer.peer_ip 
+                           << ": Sending initial routing table (" 
+                           << update_for_new_peer.advertised_routes.size() << " routes)." << std::endl;
+            }
             send_message(peer.peer_ip, update_for_new_peer);
         }
     }
@@ -699,6 +749,9 @@ void load_topology(const std::string& filename, std::vector<Router*>& all_router
 }
 
 void Router::tick(bool verbose) {
+    if (!is_active_) {
+    return; // Don't process anything if shut down
+}
     for (auto& [peer_ip, peer] : peers_) {
         peer.total_interactions++;
         if (peer.state == SessionState::IDLE) {
@@ -769,11 +822,13 @@ void print_help() {
               << "  **policy <r_id> [in|out] [permit|deny] prefix <p/l> - Add a policy to a router.**\n"
               << "  announce <r_id> <prefix/len>     - Simulate a prefix hijack from a router.**\n"
               << "  withdraw <r_id> <prefix/len>     - Withdraw route from its original source.\n"
+              << "  shutdown <router_id>            - Shut down a router and its BGP sessions.\n"
+              << "  startup <router_id>             - Start up a previously shut down router.\n"
               << "  help                             - Show this help message.\n"
               << "  exit / quit                        - Exit the simulator.\n";
 }
 
-// --- CHANGE: Added verbose parameter with default value ---
+// verbose parameter with default value ---
 void run_simulation_ticks(std::vector<Router*>& routers, int count, bool verbose = true) {
     for (int i = 0; i < count; ++i) {
         for(Router* r : routers) {
@@ -800,7 +855,7 @@ int main(int argc, char* argv[]) {
     }
 
     std::cout << "\n--- Initializing Network and Establishing Sessions... ---" << std::endl;
-    // --- CHANGE: Run silently ---
+
     run_simulation_ticks(all_routers, 3, false);
     std::cout << "Done." << std::endl;
 
@@ -810,7 +865,6 @@ int main(int argc, char* argv[]) {
     }
     
     std::cout << "\n--- Allowing Trust Protocol to Propagate... ---" << std::endl;
-    // --- CHANGE: Run silently ---
     run_simulation_ticks(all_routers, 10, false);
     std::cout << "Done." << std::endl;
 
@@ -1005,8 +1059,7 @@ int main(int argc, char* argv[]) {
                 std::cout << "Error: Could not parse prefix '" << prefix_str << "'." << std::endl;
                 continue;
             }
-        
-        } else if (command == "resend-routes") {
+            } else if (command == "resend-routes") {
             if (tokens.size() != 2) {
                 std::cout << "Usage: resend-routes <router_id>" << std::endl;
                 continue;
@@ -1017,10 +1070,26 @@ int main(int argc, char* argv[]) {
                 continue;
             }
             Router::network[router_id]->resend_routes();
+        } else if (command == "shutdown" && tokens.size() == 2) {
+            const std::string& router_id = tokens[1];
+            if (Router::network.count(router_id)) {
+                Router::network[router_id]->shutdown();
+            } else {
+                std::cout << "Error: Router '" << router_id << "' not found." << std::endl;
+            }
+        } else if (command == "startup" && tokens.size() == 2) {
+            const std::string& router_id = tokens[1];
+            if (Router::network.count(router_id)) {
+                Router::network[router_id]->startup();
+            } else {
+                std::cout << "Error: Router '" << router_id << "' not found." << std::endl;
+            }
+        // --- The closing brace was moved here ---
         } else {
             std::cout << "Error: Unknown command '" << command << "'. Type 'help' for available commands." << std::endl;
         }
     }
+
 
     // Cleanup
     for (Router* r : all_routers) {
