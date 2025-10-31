@@ -10,6 +10,7 @@
 #include <sstream>
 #include <cstdint>
 #include <iomanip>
+#include <set>
 
 struct IpPacket {
     std::vector<bool> bits; // The entire packet as a sequence of bits
@@ -20,7 +21,7 @@ struct IpPacket {
 
 struct IpPrefix {
     std::string network_address;
-    int prefix_length;
+    uint8_t prefix_length;
 
     bool operator==(const IpPrefix& other) const {
         return network_address == other.network_address && prefix_length == other.prefix_length;
@@ -46,6 +47,15 @@ struct Route {
     int local_pref = 100;
     int med = 0;
     OriginType origin;
+
+    bool operator==(const Route& other) const {
+        return prefix == other.prefix
+            && next_hop_ip == other.next_hop_ip
+            && as_path == other.as_path
+            && local_pref == other.local_pref
+            && med == other.med
+            && origin == other.origin;
+    }
 };
 
 enum class SessionState {
@@ -148,8 +158,10 @@ public:
     bool is_active() const { return is_active_; }
     static std::map<std::string, Router*> network;
     std::vector<Policy> policies;
-
     void print_trust_table() const;
+    bool has_peer(const std::string& peer_ip) const {
+        return peers_.find(peer_ip) != peers_.end();
+    }
 
 
     Router(const std::string& id, uint32_t as_num) : router_id_(id), as_number_(as_num) {
@@ -188,61 +200,61 @@ public:
         // The tick() method will automatically begin re-establishing sessions.
     }
 
-    void receive_message(const std::string& from_ip, const Header& message, bool verbose) {
-            auto it = peers_.find(from_ip);
-    if (it == peers_.end()) {
-        if (verbose) {
-            std::cout << router_id_ << ": Received message from unknown peer " 
-                      << from_ip << ". Ignoring." << std::endl;
-        }
-        return;
+void receive_message(const std::string& from_ip, const Header& message, bool verbose) {
+        auto it = peers_.find(from_ip);
+if (it == peers_.end()) {
+    if (verbose) {
+        std::cout << router_id_ << ": Received message from unknown peer " 
+                  << from_ip << ". Ignoring." << std::endl;
     }
-    
-    Peer& peer = it->second;
-        switch (message.type) {
-            case MessageType::OPEN:
-                handle_open(peer, static_cast<const OpenMessage&>(message), verbose);
-                break;
-            case MessageType::UPDATE:
-                handle_update(peer, static_cast<const UpdateMessage&>(message), verbose);
-                break;
-            case MessageType::KEEPALIVE:
-                handle_keepalive(peer, static_cast<const KeepaliveMessage&>(message), verbose);
-                break;
-            case MessageType::NOTIFICATION:
-            if (verbose) {
-                std::cout << router_id_ << " <- " << peer.peer_ip << ": Received NOTIFICATION. Tearing down session." << std::endl;
-            }
-            if (total_trust_values_.count(peer.peer_ip)) {
-                total_trust_values_[peer.peer_ip] /= 2.0;
-            }
-            peer.state = SessionState::IDLE;
+    return;
+}
 
-            // Remove all routes learned from this peer ---
-            {
-                std::vector<IpPrefix> prefixes_to_remove;
-                for (const auto& [prefix, route] : routing_table_) {
-                    if (route.next_hop_ip == peer.peer_ip) {
-                        prefixes_to_remove.push_back(prefix);
-                    }
-                }
-
-                if (!prefixes_to_remove.empty()) {
-                    if (verbose) {
-                        std::cout << "    " << router_id_ << ": Removing " << prefixes_to_remove.size() << " stale route(s) from peer " << peer.peer_ip << "." << std::endl;
-                    }
-                    for (const auto& prefix : prefixes_to_remove) {
-                        routing_table_.erase(prefix);
-                    }
-                    // For this project, simply removing the routes is sufficient.
-                }
-            }
+Peer& peer = it->second;
+    switch (message.type) {
+        case MessageType::OPEN:
+            handle_open(peer, static_cast<const OpenMessage&>(message), verbose);
             break;
-            case MessageType::TRUST_MESSAGE:
-                handle_trust_message(peer, static_cast<const TrustMessage&>(message));
-                break;
+        case MessageType::UPDATE:
+            handle_update(peer, static_cast<const UpdateMessage&>(message), verbose);
+            break;
+        case MessageType::KEEPALIVE:
+            handle_keepalive(peer, static_cast<const KeepaliveMessage&>(message), verbose);
+            break;
+        case MessageType::NOTIFICATION:
+        if (verbose) {
+            std::cout << router_id_ << " <- " << peer.peer_ip << ": Received NOTIFICATION. Tearing down session." << std::endl;
         }
+        if (total_trust_values_.count(peer.peer_ip)) {
+            total_trust_values_[peer.peer_ip] /= 2.0;
+        }
+        peer.state = SessionState::IDLE;
+
+        // Remove all routes learned from this peer ---
+        {
+            std::vector<IpPrefix> prefixes_to_remove;
+            for (const auto& [prefix, route] : routing_table_) {
+                if (route.next_hop_ip == peer.peer_ip) {
+                    prefixes_to_remove.push_back(prefix);
+                }
+            }
+
+            if (!prefixes_to_remove.empty()) {
+                if (verbose) {
+                    std::cout << "    " << router_id_ << ": Removing " << prefixes_to_remove.size() << " stale route(s) from peer " << peer.peer_ip << "." << std::endl;
+                }
+                for (const auto& prefix : prefixes_to_remove) {
+                    routing_table_.erase(prefix);
+                }
+                // For this project, simply removing the routes is sufficient.
+            }
+        }
+        break;
+        case MessageType::TRUST_MESSAGE:
+            handle_trust_message(peer, static_cast<const TrustMessage&>(message));
+            break;
     }
+}
 
     static uint64_t bits_to_uint(const std::vector<bool>& bits, size_t offset, int num_bits) {
         uint64_t result = 0;
@@ -366,7 +378,16 @@ public:
 
     void add_policy_rule(const Policy& rule) {
         policies.push_back(rule);
+
+    if (rule.direction == PolicyDirection::OUTBOUND && rule.action == PolicyAction::DENY) {
+        
+        if (routing_table_.count(rule.match_prefix)) {
+            // we must proactively send a WITHDRAW to all our peers
+            //    to pull back our previous advertisement.
+            send_policy_based_withdrawal(rule.match_prefix);
+        }
     }
+}
 
     void withdraw_route(const IpPrefix& prefix, bool verbose = true) {
         if (verbose) {
@@ -407,10 +428,29 @@ public:
         }
     }
 
+    void add_route_reflector_client(const std::string& peer_ip) {
+        // Use the private 'peers_' member
+        if (peers_.count(peer_ip)) {
+            // Use the private 'as_number_' member
+            if (peers_.at(peer_ip).peer_as == this->as_number_) {
+                std::cout << "   Configuring peer " << peer_ip << " as a route-reflector-client." << std::endl;
+                // Use the new private 'route_reflector_clients_' member
+                route_reflector_clients_.insert(peer_ip);
+            } else {
+                std::cout << "   Error: Peer " << peer_ip << " is an eBGP peer. Cannot be a client." << std::endl;
+            }
+        } else {
+            // Use the private 'router_id_' member
+            std::cout << "   Error: Peer " << peer_ip << " not found for router " << router_id_ << "." << std::endl;
+        }
+    }
+
 private:
     std::string router_id_;
     uint32_t as_number_;
     std::map<std::string, Peer> peers_;
+    std::set<std::string> route_reflector_clients_; // New member to track route-reflector clients
+    std::map<IpPrefix, std::map<std::string, Route>> bgp_table_;
     std::map<IpPrefix, Route> routing_table_;
     std::vector<Header*> inbox_;
     int tick_counter_ = 0;
@@ -471,6 +511,45 @@ private:
         }
     }
 
+    bool find_and_install_best_path(const IpPrefix& prefix) {
+    if (bgp_table_.count(prefix) == 0 || bgp_table_[prefix].empty()) { 
+        if (routing_table_.count(prefix)) {
+            routing_table_.erase(prefix);
+            return true; // The table changed
+        }
+        return false;
+    }
+    // Find the best route among all candidates
+    Route* best_route = nullptr;
+    const std::map<std::string, Route>& candidates = bgp_table_[prefix];
+
+    for (const auto& [peer_ip, route] : candidates) {
+        if (best_route == nullptr) {
+            best_route = new Route(route); // Copy the first route as the current best
+        } else {
+            double new_trust = get_trust(route.next_hop_ip);
+            double new_pref = route.local_pref * new_trust;
+            
+            double old_trust = get_trust(best_route->next_hop_ip);
+            double old_pref = best_route->local_pref * old_trust;
+            
+            if (new_pref > old_pref) {
+                *best_route = route; // Found a better route
+            } else if (new_pref == old_pref && route.as_path.size() < best_route->as_path.size()) {
+                *best_route = route; // Found a better route
+            }
+        }
+    }
+    bool changed = false;
+    if (routing_table_.count(prefix) == 0 || !(routing_table_[prefix] == *best_route)) {
+        routing_table_[prefix] = *best_route;
+        changed = true;
+    }
+    
+    delete best_route;
+    return changed;
+}
+
     void handle_update(Peer& peer, const UpdateMessage& message, bool verbose) {
         if (peer.state != SessionState::ESTABLISHED) return;
         if (verbose) {
@@ -479,74 +558,238 @@ private:
         bool table_changed = false;
 
         for (const auto& withdrawn_prefix : message.withdrawn_routes) {
-        // Check if we have a route for this prefix
-        if (routing_table_.count(withdrawn_prefix)) {
-            // only remove the route if it came from the peer who is now withdrawing it.
-            if (routing_table_.at(withdrawn_prefix).next_hop_ip == peer.peer_ip) {
-                routing_table_.erase(withdrawn_prefix);
-                table_changed = true; // A withdrawal is a table change
-                if (verbose) {
-                    std::cout << "    Route to " << withdrawn_prefix.network_address << "/" << withdrawn_prefix.prefix_length 
-                              << " withdrawn by " << peer.peer_ip << "." << std::endl;
-                }
+if (bgp_table_.count(withdrawn_prefix)) {
+        if (bgp_table_[withdrawn_prefix].erase(peer.peer_ip) > 0) {
+            table_changed = true;
+            if (verbose) {
+                std::cout << "    Route to " << withdrawn_prefix.network_address << "/" << static_cast<int>(withdrawn_prefix.prefix_length)
+                          << " from " << peer.peer_ip << " removed from BGP table." << std::endl;
             }
+            find_and_install_best_path(withdrawn_prefix);
         }
     }
+}
 
-        for (const auto& new_route_info : message.advertised_routes) {
+for (const auto& new_route_info : message.advertised_routes) {
+
+    if (peer.peer_as != this->as_number_) {
+                bool loop_detected = false;
+                for (uint32_t asn_in_path : new_route_info.as_path) {
+                    if (asn_in_path == this->as_number_) {
+                        loop_detected = true;
+                        break;
+                    }
+                }
+                
+                if (loop_detected) {
+                    if (verbose) {
+                        std::cout << "   Route " << new_route_info.prefix.network_address << "/" 
+                                  << static_cast<int>(new_route_info.prefix.prefix_length) 
+                                  << " REJECTED from " << peer.peer_ip << ": BGP Loop detected." << std::endl;
+                    }
+                    continue; // Skip (reject) this route
+                }
+            }
+
             Route candidate_route = new_route_info;
-            candidate_route.next_hop_ip = peer.peer_ip;
+            
+            if (peer.peer_as != this->as_number_) {
+                candidate_route.next_hop_ip = peer.peer_ip;
+                candidate_route.as_path.push_front(peer.peer_as);
+            }
 
             if (!this->apply_inbound_policies(candidate_route, peer)) {
                 if (verbose) {
-                    std::cout << "   Route " << candidate_route.prefix.network_address << "/" << candidate_route.prefix.prefix_length 
+                    std::cout << "   Route " << candidate_route.prefix.network_address << "/" 
+                              << static_cast<int>(candidate_route.prefix.prefix_length) 
                               << " denied by inbound policy from " << peer.peer_ip << std::endl;
                 }
+                
+                if (bgp_table_.count(candidate_route.prefix) && 
+                    bgp_table_[candidate_route.prefix].count(peer.peer_ip)) 
+                {
+                    bgp_table_[candidate_route.prefix].erase(peer.peer_ip);
+                    if (verbose) {
+                        std::cout << "   Removing stale route from BGP table due to new deny policy." << std::endl;
+                    }
+                    if (find_and_install_best_path(candidate_route.prefix)) {
+                        table_changed = true;
+                    }
+                }
+                
                 continue;
             }
 
-            double next_hop_trust = get_trust(candidate_route.next_hop_ip);
-            double effective_local_pref = candidate_route.local_pref * next_hop_trust;
+            bgp_table_[candidate_route.prefix][peer.peer_ip] = candidate_route;
 
-            if (routing_table_.count(candidate_route.prefix) == 0) {
-                routing_table_[candidate_route.prefix] = candidate_route;
+            if (verbose) {
+                 std::cout << "   Route " << candidate_route.prefix.network_address << "/" 
+                           << static_cast<int>(candidate_route.prefix.prefix_length)
+                           << " from " << peer.peer_ip << " accepted into BGP table." << std::endl;
+            }
+
+            bool best_path_was_updated = find_and_install_best_path(candidate_route.prefix);
+
+            if (best_path_was_updated) {
                 table_changed = true;
-            } else {
-                Route& existing_route = routing_table_.at(candidate_route.prefix);
-                double existing_route_trust = get_trust(existing_route.next_hop_ip);
-                double existing_effective_local_pref = existing_route.local_pref * existing_route_trust;
-
-                if (effective_local_pref > existing_effective_local_pref) {
-                    existing_route = candidate_route;
-                    table_changed = true;
-                } else if (effective_local_pref == existing_effective_local_pref &&
-                           candidate_route.as_path.size() < existing_route.as_path.size()) {
-                    existing_route = candidate_route;
-                    table_changed = true;
+                if (verbose) {
+                    std::cout << "   New best path for " << candidate_route.prefix.network_address << "/" 
+                              << static_cast<int>(candidate_route.prefix.prefix_length)
+                              << " installed." << std::endl;
                 }
             }
         }
 
-        if (table_changed) {
+     if (table_changed) {
             if (verbose) {
                 std::cout << "   " << router_id_ << "'s routing table changed. Propagating updates." << std::endl;
             }
-            for (auto const& [next_peer_ip, next_peer] : peers_) {
-                if (next_peer_ip != peer.peer_ip && next_peer.state == SessionState::ESTABLISHED) {
-                    UpdateMessage downstream_update;
-                    for (const auto& [prefix, route] : routing_table_) {
-                        Route new_advertisement = route;
-                        new_advertisement.as_path.push_front(this->as_number_);
-                        if (!apply_outbound_policies(new_advertisement, next_peer)) {
-                            if (verbose) {
-                                std::cout << "   Route " << new_advertisement.prefix.network_address << "/" << new_advertisement.prefix.prefix_length 
-                                          << " denied by outbound policy to " << next_peer.peer_ip << std::endl;
-                            }
-                            continue;
-                        }
-                        downstream_update.advertised_routes.push_back(new_advertisement);
+            if (route_reflector_clients_.empty()) 
+            {
+                // STANDARD BGP ROUTER (Not an RR)
+                // We obey the iBGP Split-Horizon rule.
+                
+                for (auto const& [next_peer_ip, next_peer] : peers_) {
+                    if (next_peer_ip == peer.peer_ip || next_peer.state != SessionState::ESTABLISHED) {
+                        continue;
                     }
-                    send_message(next_peer_ip, downstream_update);
+
+                    // iBGP Split Horizon Rule Check
+                    // (Don't advertise a route from an iBGP peer to another iBGP peer)
+                    bool source_is_ibgp = (peer.peer_as == this->as_number_);
+                    bool dest_is_ibgp = (next_peer.peer_as == this->as_number_);
+                    
+                    if (source_is_ibgp && dest_is_ibgp) {
+                        // This is the split-horizon rule. Don't propagate.
+                        if (verbose) {
+                             std::cout << "   Skipping peer " << next_peer_ip << " (iBGP Split Horizon)." << std::endl;
+                        }
+                        continue; 
+                    }
+                    
+                    // This peer is OK to send to (either eBGP, or from eBGP to iBGP)
+                    UpdateMessage downstream_update;
+
+                    for (const auto& withdrawn_prefix : message.withdrawn_routes) {
+                         // Only propagate withdrawals if our best path was affected
+                        if (!routing_table_.count(withdrawn_prefix)) {
+                             downstream_update.withdrawn_routes.push_back(withdrawn_prefix);
+                        }
+                    }
+
+                    // Propagate advertisements
+                    for (const auto& [prefix, route] : routing_table_) {
+                        // We only need to advertise the routes that just changed.
+                        // A simple way is to check if the new best route is the one from 'peer'.
+                        if (bgp_table_.count(prefix) && bgp_table_.at(prefix).count(peer.peer_ip)) {
+                             if(routing_table_.at(prefix).next_hop_ip == peer.peer_ip) {
+                                Route new_advertisement = route;
+                                if (next_peer.peer_as != this->as_number_) {
+                                    new_advertisement.as_path.push_front(this->as_number_);
+                                }
+                                if (apply_outbound_policies(new_advertisement, next_peer)) {
+                                    downstream_update.advertised_routes.push_back(new_advertisement);
+                                }
+                             }
+                        }
+                    }
+
+                    if (!downstream_update.advertised_routes.empty() || !downstream_update.withdrawn_routes.empty()) {
+                        send_message(next_peer_ip, downstream_update);
+                    }
+                }
+            } 
+            else 
+            {
+                // ROUTE REFLECTOR (RR)
+
+                for (auto const& [next_peer_ip, next_peer] : peers_) {
+                    if (next_peer_ip == peer.peer_ip || next_peer.state != SessionState::ESTABLISHED) {
+                        continue;
+                    }
+
+                    UpdateMessage downstream_update;
+                    
+                    // Propagate withdrawals
+                    for (const auto& withdrawn_prefix : message.withdrawn_routes) {
+                        if (!routing_table_.count(withdrawn_prefix)) {
+                             downstream_update.withdrawn_routes.push_back(withdrawn_prefix);
+                        }
+                    }
+
+                    bool sending_to_client = route_reflector_clients_.count(next_peer_ip);
+                    bool sending_to_ibgp = (next_peer.peer_as == this->as_number_);
+                    bool sending_to_ebgp = !sending_to_ibgp;
+
+                    // Iterate over *all* best routes (not just the changed ones)
+                    // This is simpler and more robust for RR logic
+                    for (const auto& [prefix, route] : routing_table_) {
+
+                        // --- Find the *source* of this best route ---
+                        bool best_route_originated_by_us = (route.next_hop_ip == this->router_id_);
+                        bool best_route_from_ebgp = false;
+                        bool best_route_from_client = false;
+                        bool best_route_from_non_client_ibgp = false;
+
+                        if (!best_route_originated_by_us) {
+                            // Find the peer who gave us this best path
+                            std::string best_path_source_peer_ip = "";
+                            if (bgp_table_.count(prefix)) {
+                                for (auto const& [src_ip, peer_route] : bgp_table_.at(prefix)) {
+                                    if (peer_route.next_hop_ip == route.next_hop_ip && peer_route.as_path == route.as_path) {
+                                        best_path_source_peer_ip = src_ip;
+                                        break;
+                                    }
+                                }
+                            }
+                            
+                            if (peers_.count(best_path_source_peer_ip)) {
+                                Peer& source_peer = peers_.at(best_path_source_peer_ip);
+                                if (source_peer.peer_as != this->as_number_) {
+                                    best_route_from_ebgp = true;
+                                } else {
+                                    if (route_reflector_clients_.count(best_path_source_peer_ip)) {
+                                        best_route_from_client = true;
+                                    } else {
+                                        best_route_from_non_client_ibgp = true;
+                                    }
+                                }
+                            } else if (!best_path_source_peer_ip.empty()) {
+                                // Peer isn't in our list? Must be eBGP.
+                                best_route_from_ebgp = true;
+                            }
+                        }
+
+                        Route new_advertisement = route;
+                        if (sending_to_ebgp) {
+                            new_advertisement.as_path.push_front(this->as_number_);
+                        }
+                        if (!apply_outbound_policies(new_advertisement, next_peer)) {
+                            continue; // Denied by outbound policy
+                        }
+
+                        if (sending_to_ebgp) {
+                            // Always send best routes to eBGP peers
+                            downstream_update.advertised_routes.push_back(new_advertisement);
+                        } else { 
+                            // Sending to an iBGP peer (client or non-client)
+                            if (best_route_from_client) {
+                                // Route from client -> Reflect to ALL (clients and non-clients)
+                                downstream_update.advertised_routes.push_back(new_advertisement);
+                            } else if (best_route_from_non_client_ibgp) {
+                                // Route from non-client iBGP -> Reflect to CLIENTS ONLY
+                                if (sending_to_client) {
+                                    downstream_update.advertised_routes.push_back(new_advertisement);
+                                }
+                            } else { // best_route_from_ebgp or best_route_originated_by_us
+                                // Route from eBGP or originated by us -> Reflect to ALL iBGP peers
+                                downstream_update.advertised_routes.push_back(new_advertisement);
+                            }
+                        }
+                    }
+                    if (!downstream_update.advertised_routes.empty() || !downstream_update.withdrawn_routes.empty()) {
+                        send_message(next_peer_ip, downstream_update);
+                    }
                 }
             }
         }
@@ -590,6 +833,22 @@ private:
         }
         return true;
     }
+
+    void send_policy_based_withdrawal(const IpPrefix& prefix) {
+    std::cout << "Router " << router_id_ << " sending policy-based withdraw for "
+              << prefix.network_address << "/" << prefix.prefix_length << std::endl;
+
+    UpdateMessage update;
+    update.withdrawn_routes.push_back(prefix); // Create a message containing only the withdrawal
+
+    for (auto const& [peer_ip, peer] : peers_) {
+        if (peer.state == SessionState::ESTABLISHED) {
+            // Send the withdrawal to all established peers.
+            // They will ignore it if they don't have the route.
+            send_message(peer_ip, update);
+        }
+    }
+}
 };
 
 void Router::process_inbox(bool verbose) {
@@ -714,35 +973,99 @@ void Router::originate_route(const IpPrefix& prefix, bool verbose) {
     }
 }
 
-void load_topology(const std::string& filename, std::vector<Router*>& all_routers) {
+void load_topology(const std::string& filename,
+                   std::vector<Router*>& all_routers,
+                   std::map<uint32_t, IpPrefix>& as_prefixes) // Added as_prefixes map
+{
     std::ifstream infile(filename);
+    if (!infile.is_open()) {
+        std::cerr << "Error: Could not open topology file: " << filename << std::endl;
+        return;
+    }
+
     std::string line;
-    enum Section { NONE, ROUTERS, LINKS };
+    // Added PREFIXES state
+    enum Section { NONE, ROUTERS, LINKS, PREFIXES }; 
     Section current = NONE;
-    std::map<std::string, int> router_as_map;
+    
+    // Map to temporarily store router_id -> asn mapping, useful for [Links] section
+    std::map<std::string, uint32_t> router_as_map;
+
     while (std::getline(infile, line)) {
+        // Strip comments
         auto comment_pos = line.find('#');
-        if (comment_pos != std::string::npos) line = line.substr(0, comment_pos);
+        if (comment_pos != std::string::npos) {
+            line = line.substr(0, comment_pos);
+        }
         std::istringstream iss(line);
         std::string token;
-        if (!(iss >> token)) continue;
+        // Skip empty or whitespace-only lines
+        if (!(iss >> token)) {
+            continue; 
+        }
         if (token == "[Routers]") { current = ROUTERS; continue; }
         if (token == "[Links]") { current = LINKS; continue; }
+        // Check for [Prefixes] section
+        if (token == "[Prefixes]") { current = PREFIXES; continue; }
         if (current == ROUTERS) {
             std::string router_id = token;
             uint32_t asn;
-            if (!(iss >> asn)) continue;
-            auto* r = new Router(router_id, asn);
+            if (!(iss >> asn)) {
+                std::cerr << "Warning: Malformed [Routers] line: " << line << std::endl;
+                continue;
+            }
+            Router* r = new Router(router_id, asn);
             all_routers.push_back(r);
             Router::network[router_id] = r;
             router_as_map[router_id] = asn;
+
         } else if (current == LINKS) {
-            std::string router1 = token, router2;
-            if (!(iss >> router2)) continue;
-            uint32_t as2 = router_as_map[router2];
-            if (Router::network.count(router1) && Router::network.count(router2)) {
-                Router::network[router1]->add_peer(router2, as2);
-                Router::network[router2]->add_peer(router1, router_as_map[router1]);
+            std::string router1_id = token;
+            std::string router2_id;
+            if (!(iss >> router2_id)) {
+                std::cerr << "Warning: Malformed [Links] line: " << line << std::endl;
+                continue;
+            }
+
+            // Ensure both routers exist before adding peers
+            if (Router::network.count(router1_id) && Router::network.count(router2_id)) {
+                Router::network[router1_id]->add_peer(router2_id, router_as_map[router2_id]);
+                Router::network[router2_id]->add_peer(router1_id, router_as_map[router1_id]);
+            } else {
+                std::cerr << "Warning: Skipping link for unknown router: " << line << std::endl;
+            }
+        
+        // Handle [Prefixes]
+        } else if (current == PREFIXES) {
+            // Token is the AS Number (e.g., 65001)
+            uint32_t asn = static_cast<uint32_t>(std::stoul(token));
+            
+            std::string prefix_str; // e.g., "172.16.1.0/24"
+            if (!(iss >> prefix_str)) {
+                std::cerr << "Warning: Malformed [Prefixes] line: " << line << std::endl;
+                continue;
+            }
+
+            auto slash_pos = prefix_str.find('/');
+            if (slash_pos == std::string::npos) {
+                std::cerr << "Warning: Prefix missing '/' in line: " << line << std::endl;
+                continue;
+            }
+
+            // Split the string into address and length
+            std::string net_addr = prefix_str.substr(0, slash_pos);
+            std::string len_str = prefix_str.substr(slash_pos + 1);
+
+            try {
+                // Create the prefix object
+                IpPrefix prefix;
+                prefix.network_address = net_addr;
+                prefix.prefix_length = static_cast<uint8_t>(std::stoi(len_str)); // stoi requires <string>
+
+                // Store in the map
+                as_prefixes[asn] = prefix;
+            } catch (const std::exception& e) {
+                std::cerr << "Warning: Invalid prefix length in line: " << line << " (" << e.what() << ")" << std::endl;
             }
         }
     }
@@ -848,8 +1171,9 @@ int main(int argc, char* argv[]) {
     }
 
     std::vector<Router*> all_routers;
+    std::map<uint32_t, IpPrefix> as_prefixes;
     if (!topology_file.empty()) {
-        load_topology(topology_file, all_routers);
+        load_topology(topology_file, all_routers, as_prefixes);
     } else {
         std::cout << "--- BGP Simulator Startup (Hardcoded Topology) ---" << std::endl;
     }
@@ -859,9 +1183,41 @@ int main(int argc, char* argv[]) {
     run_simulation_ticks(all_routers, 3, false);
     std::cout << "Done." << std::endl;
 
-    std::cout << "\n--- Originating Routes and Allowing Network to Converge... ---" << std::endl;
-    if (!all_routers.empty()) {
-        all_routers[0]->originate_route({"10.10.10.0", 24}, true);
+std::cout << "\n--- Originating Routes from Each AS... ---" << std::endl;
+    
+    // A set to track which ASes have already originated their prefix
+    std::set<uint32_t> originated_ases;
+
+    for (Router* router : all_routers) {
+        uint32_t as_num = router->get_as_number();
+
+        // Only originate once per AS
+        if (originated_ases.find(as_num) == originated_ases.end()) {
+            
+            // Look up the prefix for this AS in the map populated from the .conf file
+            auto it = as_prefixes.find(as_num);
+            
+            if (it != as_prefixes.end()) {
+                // Found a prefix for this AS
+                IpPrefix prefix_to_originate = it->second;
+
+                std::cout << "Router " << router->get_router_id()
+                          << " (AS " << as_num << ") is originating "
+                          << prefix_to_originate.network_address << "/" 
+                          << static_cast<int>(prefix_to_originate.prefix_length) << std::endl;
+
+                // Tell the router to originate its network prefix
+                router->originate_route(prefix_to_originate, true);
+
+            } else {
+                // No prefix was defined for this AS in the [Prefixes] section
+                std::cout << "Warning: No [Prefixes] entry found for AS " << as_num
+                          << ". It will not originate any routes." << std::endl;
+            }
+
+            // Mark this AS as processed so other routers in the same AS don't also originate
+            originated_ases.insert(as_num);
+        }
     }
     
     std::cout << "\n--- Allowing Trust Protocol to Propagate... ---" << std::endl;
@@ -929,8 +1285,28 @@ int main(int argc, char* argv[]) {
                 } catch (const std::exception& e) {
                     std::cout << "Error: Invalid AS number '" << asn_str << "'." << std::endl;
                 }
+            } else if (tokens.size() == 4 && tokens[3] == "route-reflector-client") {
+                const std::string& router_id = tokens[1];
+                const std::string& peer_ip = tokens[2];
+
+                if (Router::network.count(router_id) == 0) {
+                    std::cout << "Error: Router '" << router_id << "' not found." << std::endl;
+                    continue;
+                }
+                
+                Router* router = Router::network[router_id];
+                
+                if (!router->has_peer(peer_ip)) { 
+                     std::cout << "Error: Peer " << peer_ip << " is not a configured neighbor on " << router_id << "." << std::endl;
+                     continue;
+                }
+                
+                // Call the new method we added
+                router->add_route_reflector_client(peer_ip);
+            
             } else {
                 std::cout << "Usage: neighbor <router_id> <peer_ip> remote-as <asn>" << std::endl;
+                std::cout << "   or: neighbor <router_id> <peer_ip> route-reflector-client" << std::endl;
             }
         } else if (command == "show") {
             if (tokens.size() == 4 && tokens[1] == "ip" && tokens[2] == "bgp") {
