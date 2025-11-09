@@ -23,6 +23,10 @@ struct IpPrefix {
     std::string network_address;
     uint8_t prefix_length;
 
+    std::string to_string() const {
+        return network_address + "/" + std::to_string(prefix_length);
+    }
+
     bool operator==(const IpPrefix& other) const {
         return network_address == other.network_address && prefix_length == other.prefix_length;
     }
@@ -31,6 +35,10 @@ struct IpPrefix {
         if (network_address != other.network_address)
             return network_address < other.network_address;
         return prefix_length < other.prefix_length;
+    }
+
+    bool is_default() const {
+        return network_address.empty() && prefix_length == 0;
     }
 };
 
@@ -376,17 +384,56 @@ Peer& peer = it->second;
         }
     }
 
-    void add_policy_rule(const Policy& rule) {
-        policies.push_back(rule);
+void add_policy_rule(const Policy& rule) {
+    policies.push_back(rule);
 
     if (rule.direction == PolicyDirection::OUTBOUND && rule.action == PolicyAction::DENY) {
+  
+        if (rule.match_peer_ip.empty()) {
+            std::cout << "Applying general outbound deny for " << rule.match_prefix.to_string() 
+                      << ". Withdrawing from ALL peers." << std::endl;
+            
+            send_withdrawal_all(rule.match_prefix);
+
+        } else {
+            
+            std::cout << "Applying specific outbound deny for " << rule.match_prefix.to_string() 
+                      << " to peer " << rule.match_peer_ip << "." << std::endl;
+            
+            send_withdrawal_peer(rule.match_prefix, rule.match_peer_ip);
+        }
+
+    } else if (rule.direction == PolicyDirection::INBOUND && rule.action == PolicyAction::DENY) {
+    std::cout << "Applying new inbound deny for " << rule.match_prefix.to_string() 
+              << ". Re-evaluating BGP table." << std::endl;
+    
+    if (bgp_table_.count(rule.match_prefix)) {
+        bool path_changed = false;
         
-        if (routing_table_.count(rule.match_prefix)) {
-            // we must proactively send a WITHDRAW to all our peers
-            //    to pull back our previous advertisement.
-            send_policy_based_withdrawal(rule.match_prefix);
+        // Iterate over all peers that gave us this route
+        for (auto it = bgp_table_[rule.match_prefix].begin(); it != bgp_table_[rule.match_prefix].end(); /* no increment */) {
+            
+            std::string peer_ip = it->first;
+            
+            // Does
+            bool peer_matches = rule.match_peer_ip.empty() || (rule.match_peer_ip == peer_ip);
+
+            if (peer_matches) {
+                // Yes, this existing route is now denied. Erase it.
+                it = bgp_table_[rule.match_prefix].erase(it);
+                path_changed = true;
+                std::cout << "   Removing existing route from peer " << peer_ip << std::endl;
+            } else {
+                ++it;
+            }
+        }
+
+        if (path_changed) {
+            // The old best path might have been removed. Find the new best one.
+            find_and_install_best_path(rule.match_prefix);
         }
     }
+}
 }
 
     void withdraw_route(const IpPrefix& prefix, bool verbose = true) {
@@ -797,8 +844,10 @@ for (const auto& new_route_info : message.advertised_routes) {
 
     bool apply_inbound_policies(Route& route, const Peer& peer) {
         for (const auto& policy : policies) {
-            if (policy.direction == PolicyDirection::INBOUND) {
-                if (policy.match_peer_ip == peer.peer_ip || policy.match_prefix == route.prefix) {
+        bool peer_matches = policy.match_peer_ip.empty() || (policy.match_peer_ip == peer.peer_ip);
+
+        if (policy.direction == PolicyDirection::INBOUND) {
+            if (peer_matches && policy.match_prefix == route.prefix) {
                     if (policy.action == PolicyAction::DENY) {
                         return false;
                     }
@@ -815,38 +864,53 @@ for (const auto& new_route_info : message.advertised_routes) {
         return true;
     }
 
-    bool apply_outbound_policies(Route& route, const Peer& peer) {
-        for (const auto& policy : policies) {
-            if (policy.direction == PolicyDirection::OUTBOUND) {
-                if (policy.match_peer_ip == peer.peer_ip || policy.match_prefix == route.prefix) {
-                    if (policy.action == PolicyAction::DENY) {
-                        return false;
-                    } else if (policy.action == PolicyAction::SET_LOCAL_PREF) {
-                        route.local_pref = policy.action_value;
-                    } else if (policy.action == PolicyAction::AS_PATH_PREPEND) {
-                        for (int i = 0; i < policy.action_value; ++i) {
-                            route.as_path.push_front(this->as_number_);
-                        }
+ bool apply_outbound_policies(Route& route, const Peer& peer) {
+    for (const auto& policy : policies) {
+        if (policy.direction == PolicyDirection::OUTBOUND) {
+            
+            // Check if the policy's peer matches (or if the policy doesn't care about the peer)
+            bool peer_matches = policy.match_peer_ip.empty() || policy.match_peer_ip == peer.peer_ip;
+            bool prefix_matches = policy.match_prefix.is_default() || policy.match_prefix == route.prefix;
+
+            if (peer_matches && prefix_matches) {
+
+                if (policy.action == PolicyAction::DENY) {
+                    return false; // Stop processing and deny the route
+                } else if (policy.action == PolicyAction::SET_LOCAL_PREF) {
+                    route.local_pref = policy.action_value;
+                } else if (policy.action == PolicyAction::AS_PATH_PREPEND) {
+                    for (int i = 0; i < policy.action_value; ++i) {
+                        route.as_path.push_front(this->as_number_);
                     }
                 }
             }
         }
-        return true;
     }
+    return true;
+}
 
-    void send_policy_based_withdrawal(const IpPrefix& prefix) {
-    std::cout << "Router " << router_id_ << " sending policy-based withdraw for "
-              << prefix.network_address << "/" << prefix.prefix_length << std::endl;
+  void send_withdrawal_all(const IpPrefix& prefix) {
+    std::cout << "Router " << router_id_ << " withdrawing " << prefix.to_string() 
+              << " from ALL peers." << std::endl;
 
     UpdateMessage update;
-    update.withdrawn_routes.push_back(prefix); // Create a message containing only the withdrawal
+    update.withdrawn_routes.push_back(prefix);
 
     for (auto const& [peer_ip, peer] : peers_) {
         if (peer.state == SessionState::ESTABLISHED) {
-            // Send the withdrawal to all established peers.
-            // They will ignore it if they don't have the route.
             send_message(peer_ip, update);
         }
+    }
+}
+
+void send_withdrawal_peer(const IpPrefix& prefix, const std::string& target_peer_ip) {
+    std::cout << "Router " << router_id_ << " withdrawing " << prefix.to_string() 
+              << " from peer " << target_peer_ip << std::endl;
+    UpdateMessage update;
+    update.withdrawn_routes.push_back(prefix);
+    // Only send to the one peer affected by the outbound policy
+    if (peers_.count(target_peer_ip) && peers_.at(target_peer_ip).state == SessionState::ESTABLISHED) {
+        send_message(target_peer_ip, update);
     }
 }
 };
@@ -1142,7 +1206,7 @@ void print_help() {
               << "  show trust <router_id>             - Display the trust table for a router.\n"
               << "  tick [n]                         - Advance the simulation by 'n' ticks (default is 1).\n"
               << "  neighbor <r_id> <p_ip> remote-as <asn> - Configure a new peer.\n"
-              << "  **policy <r_id> [in|out] [permit|deny] prefix <p/l> - Add a policy to a router.**\n"
+              << "  policy <r_id> [in|out] [permit|deny] prefix <p/l> - Add a policy to a router.\n"
               << "  announce <r_id> <prefix/len>     - Simulate a prefix hijack from a router.**\n"
               << "  withdraw <r_id> <prefix/len>     - Withdraw route from its original source.\n"
               << "  shutdown <router_id>            - Shut down a router and its BGP sessions.\n"
@@ -1206,7 +1270,6 @@ std::cout << "\n--- Originating Routes from Each AS... ---" << std::endl;
                           << prefix_to_originate.network_address << "/" 
                           << static_cast<int>(prefix_to_originate.prefix_length) << std::endl;
 
-                // Tell the router to originate its network prefix
                 router->originate_route(prefix_to_originate, true);
 
             } else {
@@ -1214,8 +1277,6 @@ std::cout << "\n--- Originating Routes from Each AS... ---" << std::endl;
                 std::cout << "Warning: No [Prefixes] entry found for AS " << as_num
                           << ". It will not originate any routes." << std::endl;
             }
-
-            // Mark this AS as processed so other routers in the same AS don't also originate
             originated_ases.insert(as_num);
         }
     }
