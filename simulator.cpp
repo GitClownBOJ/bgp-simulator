@@ -414,8 +414,8 @@ void add_policy_rule(const Policy& rule) {
         for (auto it = bgp_table_[rule.match_prefix].begin(); it != bgp_table_[rule.match_prefix].end(); /* no increment */) {
             
             std::string peer_ip = it->first;
-            
-            // Does
+
+            // Does the peer IP match the rule?
             bool peer_matches = rule.match_peer_ip.empty() || (rule.match_peer_ip == peer_ip);
 
             if (peer_matches) {
@@ -458,19 +458,113 @@ void add_policy_rule(const Policy& rule) {
         if (verbose) {
             std::cout << "Router " << router_id_ << " re-sending all routes to peers." << std::endl;
         }
+        // Build per-peer updates using the same propagation rules as handle_update
+        for (auto const& [next_peer_ip, next_peer] : peers_) {
+            if (next_peer.state != SessionState::ESTABLISHED) continue;
 
-        UpdateMessage update;
-        for (const auto& [prefix, route] : routing_table_) {
-            update.advertised_routes.push_back(route);
-        }
+            UpdateMessage downstream_update;
 
-        if (!update.advertised_routes.empty()) {
-            for (auto const& [peer_ip, peer] : peers_) {
-                if (peer.state == SessionState::ESTABLISHED) {
-                    // Note: In a real router, you'd re-apply outbound policies here.
-                    // For this simulation, a direct resend is sufficient.
-                    send_message(peer_ip, update);
+            bool sending_to_ibgp = (next_peer.peer_as == this->as_number_);
+            bool sending_to_ebgp = !sending_to_ibgp;
+
+            if (route_reflector_clients_.empty()) {
+                // STANDARD BGP (obey iBGP split-horizon)
+                for (const auto& [prefix, route] : routing_table_) {
+                    // Determine the source of this best route (if any)
+                    bool best_route_originated_by_us = (route.next_hop_ip == this->router_id_);
+                    std::string best_path_source_peer_ip = "";
+                    if (!best_route_originated_by_us && bgp_table_.count(prefix)) {
+                        for (auto const& [src_ip, peer_route] : bgp_table_.at(prefix)) {
+                            if (peer_route.next_hop_ip == route.next_hop_ip && peer_route.as_path == route.as_path) {
+                                best_path_source_peer_ip = src_ip;
+                                break;
+                            }
+                        }
+                    }
+
+                    bool source_is_ibgp = false;
+                    if (!best_path_source_peer_ip.empty() && peers_.count(best_path_source_peer_ip)) {
+                        source_is_ibgp = (peers_.at(best_path_source_peer_ip).peer_as == this->as_number_);
+                    }
+
+                    // iBGP split-horizon: don't advertise a route learned from an iBGP peer to another iBGP peer
+                    if (source_is_ibgp && sending_to_ibgp) {
+                        continue; // skip advertising this prefix to next_peer
+                    }
+
+                    // Prepare advertisement copy
+                    Route new_advertisement = route;
+                    if (sending_to_ebgp) {
+                        new_advertisement.as_path.push_front(this->as_number_);
+                    }
+
+                    if (!apply_outbound_policies(new_advertisement, next_peer)) {
+                        continue; // denied by outbound policy
+                    }
+
+                    downstream_update.advertised_routes.push_back(new_advertisement);
                 }
+            } else {
+                // ROUTE REFLECTOR logic
+                bool sending_to_client = route_reflector_clients_.count(next_peer_ip);
+
+                for (const auto& [prefix, route] : routing_table_) {
+                    bool best_route_originated_by_us = (route.next_hop_ip == this->router_id_);
+                    bool best_route_from_client = false;
+                    bool best_route_from_non_client_ibgp = false;
+
+                    if (!best_route_originated_by_us) {
+                        std::string best_path_source_peer_ip = "";
+                        if (bgp_table_.count(prefix)) {
+                            for (auto const& [src_ip, peer_route] : bgp_table_.at(prefix)) {
+                                if (peer_route.next_hop_ip == route.next_hop_ip && peer_route.as_path == route.as_path) {
+                                    best_path_source_peer_ip = src_ip;
+                                    break;
+                                }
+                            }
+                        }
+
+                        if (peers_.count(best_path_source_peer_ip)) {
+                            Peer& source_peer = peers_.at(best_path_source_peer_ip);
+                            if (source_peer.peer_as != this->as_number_) {
+                                // eBGP route - no special flags
+                            } else {
+                                if (route_reflector_clients_.count(best_path_source_peer_ip)) {
+                                    best_route_from_client = true;
+                                } else {
+                                    best_route_from_non_client_ibgp = true;
+                                }
+                            }
+                        }
+                    }
+
+                    Route new_advertisement = route;
+                    if (sending_to_ebgp) {
+                        new_advertisement.as_path.push_front(this->as_number_);
+                    }
+                    if (!apply_outbound_policies(new_advertisement, next_peer)) {
+                        continue; // Denied by outbound policy
+                    }
+
+                    if (sending_to_ebgp) {
+                        downstream_update.advertised_routes.push_back(new_advertisement);
+                    } else {
+                        if (best_route_from_client) {
+                            downstream_update.advertised_routes.push_back(new_advertisement);
+                        } else if (best_route_from_non_client_ibgp) {
+                            if (sending_to_client) {
+                                downstream_update.advertised_routes.push_back(new_advertisement);
+                            }
+                        } else {
+                            // Best route from eBGP or originated by us -> advertise to all iBGP peers
+                            downstream_update.advertised_routes.push_back(new_advertisement);
+                        }
+                    }
+                }
+            }
+
+            if (!downstream_update.advertised_routes.empty() || !downstream_update.withdrawn_routes.empty()) {
+                send_message(next_peer_ip, downstream_update);
             }
         }
     }
@@ -478,16 +572,14 @@ void add_policy_rule(const Policy& rule) {
     void add_route_reflector_client(const std::string& peer_ip) {
         // Use the private 'peers_' member
         if (peers_.count(peer_ip)) {
-            // Use the private 'as_number_' member
             if (peers_.at(peer_ip).peer_as == this->as_number_) {
                 std::cout << "   Configuring peer " << peer_ip << " as a route-reflector-client." << std::endl;
-                // Use the new private 'route_reflector_clients_' member
+                // private 'route_reflector_clients_' member
                 route_reflector_clients_.insert(peer_ip);
             } else {
                 std::cout << "   Error: Peer " << peer_ip << " is an eBGP peer. Cannot be a client." << std::endl;
             }
         } else {
-            // Use the private 'router_id_' member
             std::cout << "   Error: Peer " << peer_ip << " not found for router " << router_id_ << "." << std::endl;
         }
     }
@@ -729,7 +821,14 @@ for (const auto& new_route_info : message.advertised_routes) {
                         // We only need to advertise the routes that just changed.
                         // A simple way is to check if the new best route is the one from 'peer'.
                         if (bgp_table_.count(prefix) && bgp_table_.at(prefix).count(peer.peer_ip)) {
-                             if(routing_table_.at(prefix).next_hop_ip == peer.peer_ip) {
+                            // The route we received from 'peer' may not have peer.peer_ip as the next-hop
+                            // ( iBGP preserves next-hop). Instead of comparing next-hop with peer IP,
+                            // check whether the route learned from 'peer' is the same as the installed best
+                            // route (compare next_hop and AS path).
+                            const Route& source_route = bgp_table_.at(prefix).at(peer.peer_ip);
+                            const Route& best_route = routing_table_.at(prefix);
+                            if (source_route.next_hop_ip == best_route.next_hop_ip
+                                && source_route.as_path == best_route.as_path) {
                                 Route new_advertisement = route;
                                 if (next_peer.peer_as != this->as_number_) {
                                     new_advertisement.as_path.push_front(this->as_number_);
@@ -737,7 +836,7 @@ for (const auto& new_route_info : message.advertised_routes) {
                                 if (apply_outbound_policies(new_advertisement, next_peer)) {
                                     downstream_update.advertised_routes.push_back(new_advertisement);
                                 }
-                             }
+                            }
                         }
                     }
 
@@ -748,7 +847,17 @@ for (const auto& new_route_info : message.advertised_routes) {
             } 
             else 
             {
-                // ROUTE REFLECTOR (RR)
+                // ROUTE REFLECTOR (RR) MODE
+                // When this router is configured as a route reflector, it reflects BGP routes 
+                // from one iBGP peer to other iBGP peers, breaking the standard iBGP rule that
+                // routes received from iBGP peers are not re-advertised to other iBGP peers.
+                //
+                // Route reflection rules:
+                // 1. Routes from eBGP peers: Advertised to ALL iBGP peers (clients and non-clients)
+                // 2. Routes from RR clients: Advertised to ALL other peers (both clients and non-clients)
+                // 3. Routes from non-client iBGP peers: Advertised ONLY to RR clients
+                // 4. Routes originated by this router: Advertised to ALL iBGP peers
+                // 5. Routes to eBGP peers: Always advertised if policy allows
 
                 for (auto const& [next_peer_ip, next_peer] : peers_) {
                     if (next_peer_ip == peer.peer_ip || next_peer.state != SessionState::ESTABLISHED) {
@@ -768,13 +877,12 @@ for (const auto& new_route_info : message.advertised_routes) {
                     bool sending_to_ibgp = (next_peer.peer_as == this->as_number_);
                     bool sending_to_ebgp = !sending_to_ibgp;
 
-                    // Iterate over *all* best routes (not just the changed ones)
+                    // Iterate over all best routes (not just the changed ones)
                     // This is simpler and more robust for RR logic
                     for (const auto& [prefix, route] : routing_table_) {
 
-                        // --- Find the *source* of this best route ---
+                        // -Find the source of this best route
                         bool best_route_originated_by_us = (route.next_hop_ip == this->router_id_);
-                        bool best_route_from_ebgp = false;
                         bool best_route_from_client = false;
                         bool best_route_from_non_client_ibgp = false;
 
@@ -793,7 +901,7 @@ for (const auto& new_route_info : message.advertised_routes) {
                             if (peers_.count(best_path_source_peer_ip)) {
                                 Peer& source_peer = peers_.at(best_path_source_peer_ip);
                                 if (source_peer.peer_as != this->as_number_) {
-                                    best_route_from_ebgp = true;
+                                    // eBGP route - no action needed
                                 } else {
                                     if (route_reflector_clients_.count(best_path_source_peer_ip)) {
                                         best_route_from_client = true;
@@ -803,7 +911,6 @@ for (const auto& new_route_info : message.advertised_routes) {
                                 }
                             } else if (!best_path_source_peer_ip.empty()) {
                                 // Peer isn't in our list? Must be eBGP.
-                                best_route_from_ebgp = true;
                             }
                         }
 
@@ -821,10 +928,10 @@ for (const auto& new_route_info : message.advertised_routes) {
                         } else { 
                             // Sending to an iBGP peer (client or non-client)
                             if (best_route_from_client) {
-                                // Route from client -> Reflect to ALL (clients and non-clients)
+                                // From client -> Reflect to ALL (clients and non-clients)
                                 downstream_update.advertised_routes.push_back(new_advertisement);
                             } else if (best_route_from_non_client_ibgp) {
-                                // Route from non-client iBGP -> Reflect to CLIENTS ONLY
+                                // Route from non-client iBGP: Reflect to only clients
                                 if (sending_to_client) {
                                     downstream_update.advertised_routes.push_back(new_advertisement);
                                 }
@@ -962,10 +1069,10 @@ if (peer.state == SessionState::OPEN_SENT) {
         if (verbose) {
             std::cout << "Session ESTABLISHED with " << peer.peer_ip << std::endl;
         }
-        // Send the entire routing table to the new peer.
+        // Send the entire routing table to the new peer
         UpdateMessage update_for_new_peer;
         for (const auto& [prefix, route] : routing_table_) {
-            // it will advertise ALL best paths, not just self-originated ones.
+            // it will advertise ALL best paths, not just self-originated ones
             update_for_new_peer.advertised_routes.push_back(route);
         }
         
@@ -1104,7 +1211,7 @@ void load_topology(const std::string& filename,
             // Token is the AS Number (e.g., 65001)
             uint32_t asn = static_cast<uint32_t>(std::stoul(token));
             
-            std::string prefix_str; // e.g., "172.16.1.0/24"
+            std::string prefix_str;
             if (!(iss >> prefix_str)) {
                 std::cerr << "Warning: Malformed [Prefixes] line: " << line << std::endl;
                 continue;
@@ -1206,6 +1313,7 @@ void print_help() {
               << "  show trust <router_id>             - Display the trust table for a router.\n"
               << "  tick [n]                         - Advance the simulation by 'n' ticks (default is 1).\n"
               << "  neighbor <r_id> <p_ip> remote-as <asn> - Configure a new peer.\n"
+              << "  neighbor <r_id> <p_ip> route-reflector-client - Configure peer as route reflector client.\n"
               << "  policy <r_id> [in|out] [permit|deny] prefix <p/l> - Add a policy to a router.\n"
               << "  announce <r_id> <prefix/len>     - Simulate a prefix hijack from a router.**\n"
               << "  withdraw <r_id> <prefix/len>     - Withdraw route from its original source.\n"
@@ -1362,8 +1470,10 @@ std::cout << "\n--- Originating Routes from Each AS... ---" << std::endl;
                      continue;
                 }
                 
-                // Call the new method we added
+                // Call the method to add as route reflector client
                 router->add_route_reflector_client(peer_ip);
+
+                router->resend_routes(false);
             
             } else {
                 std::cout << "Usage: neighbor <router_id> <peer_ip> remote-as <asn>" << std::endl;
@@ -1521,7 +1631,6 @@ std::cout << "\n--- Originating Routes from Each AS... ---" << std::endl;
             } else {
                 std::cout << "Error: Router '" << router_id << "' not found." << std::endl;
             }
-        // --- The closing brace was moved here ---
         } else {
             std::cout << "Error: Unknown command '" << command << "'. Type 'help' for available commands." << std::endl;
         }
