@@ -11,6 +11,8 @@
 #include <cstdint>
 #include <iomanip>
 #include <set>
+#include <termios.h>
+#include <unistd.h>
 
 struct IpPacket {
     std::vector<bool> bits; // The entire packet as a sequence of bits
@@ -1336,6 +1338,106 @@ void run_simulation_ticks(std::vector<Router*>& routers, int count, bool verbose
     }
 }
 
+class CLIHelper {
+private:
+    std::vector<std::string> history;
+    struct termios orig_termios;
+
+    void enableRawMode() {
+        tcgetattr(STDIN_FILENO, &orig_termios);
+        struct termios raw = orig_termios;
+        raw.c_lflag &= ~(ICANON | ECHO);
+        tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
+    }
+
+    void disableRawMode() {
+        tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios);
+    }
+
+    // Helper to clear the current line visually based on buffer length
+    void clearCurrentLine(int len) {
+        for (int i = 0; i < len; ++i) {
+            std::cout << "\b \b";
+        }
+        std::cout << std::flush;
+    }
+
+public:
+    CLIHelper() {}
+
+    void addToHistory(const std::string& cmd) {
+        if (cmd.empty()) return;
+        if (history.empty() || history.back() != cmd) {
+            history.push_back(cmd);
+        }
+    }
+
+    std::string getInput(const std::string& prompt) {
+        std::string current_buffer;
+        std::cout << prompt << std::flush;
+
+        enableRawMode();
+
+        int history_index = history.size(); 
+        char c;
+        
+        while (read(STDIN_FILENO, &c, 1) == 1) {
+            if (c == '\n') { // Enter
+                std::cout << "\r\n";
+                break;
+            } 
+            // Backspace/Delete
+            else if (c == 127 || c == 8) { 
+                if (!current_buffer.empty()) {
+                    current_buffer.pop_back();
+                    std::cout << "\b \b" << std::flush;
+                }
+            } 
+            // Escape sequences for arrow keys
+            else if (c == '\033') { 
+                char seq[3];
+                if (read(STDIN_FILENO, &seq[0], 1) == 0) continue;
+                if (read(STDIN_FILENO, &seq[1], 1) == 0) continue;
+
+                if (seq[0] == '[') {
+                    if (seq[1] == 'A') {
+                        if (history_index > 0) {
+                            history_index--;
+                            clearCurrentLine(current_buffer.length());
+                            current_buffer = history[history_index];
+                            std::cout << current_buffer << std::flush;
+                        }
+                    } else if (seq[1] == 'B') {
+                        if (history_index < (int)history.size()) {
+                            history_index++;
+                            clearCurrentLine(current_buffer.length());
+                            
+                            if (history_index < (int)history.size()) {
+                                current_buffer = history[history_index];
+                                std::cout << current_buffer << std::flush;
+                            } else {
+                                current_buffer = ""; // Successfully back to empty
+                            }
+                        }
+                    }
+                    // "Delete" key (sequence is usually \033[3~)
+                    else if (seq[1] > '0' && seq[1] < '9') {
+                        read(STDIN_FILENO, &seq[2], 1);
+                    }
+                }
+            } 
+            // Only allow printable characters
+            else if (!iscntrl(c)) { 
+                current_buffer += c;
+                std::cout << c << std::flush;
+            }
+        }
+
+        disableRawMode();
+        return current_buffer;
+    }
+};
+
 int main(int argc, char* argv[]) {
     std::string topology_file;
     int opt;
@@ -1394,14 +1496,20 @@ std::cout << "\n--- Originating Routes from Each AS... ---" << std::endl;
     run_simulation_ticks(all_routers, 10, false);
     std::cout << "Done." << std::endl;
 
+    CLIHelper cli;
+
+    
+
     std::cout << "\n\n--- Network converged. Entering interactive CLI. ---" << std::endl;
     print_help(); // This will now print the updated instructions
 
-    std::string line;
     while (true) {
-        std::cout << "\nBGP-Sim> ";
-        if (!std::getline(std::cin, line)) {
-            break; 
+
+        std::string line = cli.getInput("BGP-Sim> ");
+
+        // Add valid commands to history
+        if (!line.empty()) {
+            cli.addToHistory(line);
         }
 
         std::istringstream iss(line);
