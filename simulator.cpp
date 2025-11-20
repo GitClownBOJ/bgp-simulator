@@ -1319,6 +1319,7 @@ void print_help() {
               << "  withdraw <r_id> <prefix/len>     - Withdraw route from its original source.\n"
               << "  shutdown <router_id>            - Shut down a router and its BGP sessions.\n"
               << "  startup <router_id>             - Start up a previously shut down router.\n"
+              << "  resend-routes <router_id>        - Resend all routes from a router to its peers.\n"
               << "  help                             - Show this help message.\n"
               << "  exit / quit                        - Exit the simulator.\n";
 }

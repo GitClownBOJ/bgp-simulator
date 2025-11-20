@@ -41,13 +41,13 @@ The following commands are available in the simulator's CLI:
 | `show peers <router_id>` | Display the status of all BGP peers for a router. |
 | `show trust <router_id>` | Display the calculated trust scores a router holds for its peers. |
 | `tick [n]` | Advance the simulation by `n` ticks (default is 1). |
+  `neighbor <r_id> <p_ip> remote-as <asn>` | Configure a new peer. |
+  `neighbor <r_id> <p_ip> route-reflector-client` | Configure peer as route reflector client. |
 | `announce <r_id> <p/l>` | Make a router announce a (potentially false) route for a prefix. |
 | `withdraw <r_id> <p/l>` | Make a router withdraw its announcement for a prefix. |
 | `policy <r_id> [in\|out] deny <p/l>`| Apply an outbound or inbound policy to deny a prefix. |
 | `shutdown <router_id>` | Shut down a router and all its BGP sessions. |
 | `startup <router_id>` | Start up a previously shut down router. |
-| `link [down\|up] <r1> <r2>` | Bring a specific link between two routers down or up. |
-| `set trust <src> <tgt> <val>`| Manually set the trust score router `<src>` has for router `<tgt>`. |
-| `ping <dst_ip> from <src_ip>`| Simulate an IP packet to test the forwarding path. |
+  `resend-routes <router_id>` | Resend all routes from a router to its peers. |
 | `help` | Display this list of commands. |
 | `exit` / `quit` | Exit the simulator. |
