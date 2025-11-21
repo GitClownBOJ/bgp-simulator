@@ -10,7 +10,14 @@ This project is a C++ based BGP-4 simulator that models the full path-vector log
 * **Voting-Based Trust System:** Routers build trust scores for their peers based on direct interaction and recommendations from other routers. This trust score is integrated into the BGP best-path selection algorithm.
 * **Interactive Network Control:** Shut down/start up routers and drop/restore links to simulate real-world error conditions and test network resiliency.
 * **Attack Simulation:** Launch BGP prefix hijacks from any router to test the effectiveness of the trust-based defense mechanism.
-* **Packet Forwarding:** A `ping` command to simulate the data plane, showing how an IP packet would be forwarded based on the current routing tables.
+* **Real-time Monitoring:** Display BGP routing tables, peer status, and trust metrics for all routers.
+* **Route Reflection Support:** Configure and manage route reflector clients for scalable network designs.
+* **Policy-Based Filtering:** Apply inbound and outbound policies to control route propagation.
+* **Dynamic Route Announcements:** Simulate normal and malicious route announcements and withdrawals.
+* **Trust Score Visualization:** Monitor how trust scores evolve as routers interact and communicate recommendations.
+* **Network Convergence Tracking:** Observe how the network converges after topology changes or security events.
+* **Interactive CLI Interface:** User-friendly command-line interface with help documentation and command history.
+
 
 ## Getting Started
 
