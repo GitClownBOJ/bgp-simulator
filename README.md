@@ -1,6 +1,6 @@
 # BGP Simulator with Trust-Based Security
 
-This project is a C++ based BGP-4 simulator that models the full path-vector logic of the Border Gateway Protocol. It includes a dynamic, voting-based trust and reputation system designed to secure routing decisions against malicious activities like prefix hijacking. The simulation is controlled via an interactive command-line interface (CLI).
+This project is a C++ based BGP-4 simulator that models the full path-vector logic of the Border Gateway Protocol. It includes a dynamic, voting-based trust and reputation system designed to study securing routing decisions against malicious activities like prefix hijacking. The simulation is controlled via an interactive command-line interface (CLI).
 
 ## Features
 
@@ -24,19 +24,77 @@ This project is a C++ based BGP-4 simulator that models the full path-vector log
 ### Prerequisites
 You will need a C++ compiler that supports the C++17 standard, such as g++.
 
+## Installation Instructions
+
+If you do not have `g++` installed, follow the steps below for your operating system.
+
+### Linux
+
+#### Ubuntu/Debian
+Run the following commands to install the build-essential package:
+```bash
+sudo apt update
+sudo apt install build-essential
+```
+
+Verify the installation:
+```bash
+g++ --version
+```
+
+### macOS
+
+Install Xcode Command Line Tools, which includes `g++` (actually clang with g++ compatibility):
+```bash
+xcode-select --install
+```
+
+Alternatively, install via Homebrew:
+```bash
+brew install gcc
+```
+
+Note: The default `g++` on macOS is actually clang. If you need genuine GCC, use the Homebrew installation and invoke it as `g++-13`
+
+### Windows
+
+#### Option 1: MinGW-w64 (Recommended)
+1. Download the MinGW-w64 installer from [mingw-w64.org](https://www.mingw-w64.org/)
+2. Run the installer and select your architecture (x86_64 for 64-bit)
+3. Add the `bin` directory to your system PATH (e.g., `C:\mingw-w64\bin`)
+4. Verify installation in Command Prompt:
+```cmd
+   g++ --version
+```
+
+#### Option 2: MSYS2
+1. Download and install MSYS2 from [msys2.org](https://www.msys2.org/)
+2. Open MSYS2 terminal and run:
+```bash
+   pacman -S mingw-w64-x86_64-gcc
+```
+3. Add `C:\msys64\mingw64\bin` to your system PATH
+
+
 ### Compilation
 To compile the simulator, navigate to the project directory in your terminal and run the following command:
 ```sh
 g++ -std=c++17 -Wall -o bgp_sim simulator.cpp
 ```
 
-## Usage
 
 ### Running the Simulator
 To run the simulator, you must provide a topology configuration file using the `-c` flag.
+**Linux/macOS**
 ```sh
 ./bgp_sim -c topology.conf
 ```
+
+**Windows**
+```cmd
+./bgp_sim.exe -c topology.conf
+```
+
 The simulator will load the network, allow it to converge, and then present you with an interactive `BGP-Sim>` prompt.
 
 ### Command Reference
