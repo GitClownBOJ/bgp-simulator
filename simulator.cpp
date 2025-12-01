@@ -6,13 +6,20 @@
 #include <memory>
 #include <unordered_map>
 #include <fstream>
-#include <getopt.h>
 #include <sstream>
 #include <cstdint>
 #include <iomanip>
 #include <set>
+#ifdef _WIN32
+    // Windows-specific headers
+    #include <windows.h>
+    #include <conio.h>
+    #include <getopt.h>
+#else
+    // Unix/Linux
 #include <termios.h>
 #include <unistd.h>
+#endif
 
 struct IpPacket {
     std::vector<bool> bits; // The entire packet as a sequence of bits
@@ -1341,17 +1348,33 @@ void run_simulation_ticks(std::vector<Router*>& routers, int count, bool verbose
 class CLIHelper {
 private:
     std::vector<std::string> history;
-    struct termios orig_termios;
+    #ifdef _WIN32
+        DWORD originalMode;
+        HANDLE hStdin;        // Windows console handle
+    #else
+        struct termios orig_termios; // Linux storage
+    #endif
 
     void enableRawMode() {
-        tcgetattr(STDIN_FILENO, &orig_termios);
-        struct termios raw = orig_termios;
-        raw.c_lflag &= ~(ICANON | ECHO);
-        tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
+#ifdef _WIN32
+    hStdin = GetStdHandle(STD_INPUT_HANDLE);
+    GetConsoleMode(hStdin, &originalMode);
+    DWORD rawMode = originalMode & ~(ENABLE_ECHO_INPUT | ENABLE_LINE_INPUT);
+    SetConsoleMode(hStdin, rawMode);
+#else
+    tcgetattr(STDIN_FILENO, &orig_termios);
+    struct termios raw = orig_termios;
+    raw.c_lflag &= ~(ICANON | ECHO);
+    tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
+#endif
     }
 
     void disableRawMode() {
-        tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios);
+#ifdef _WIN32
+    SetConsoleMode(hStdin, originalMode);
+#else
+    tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios);
+#endif
     }
 
     // Helper to clear the current line visually based on buffer length
@@ -1373,69 +1396,111 @@ public:
     }
 
     std::string getInput(const std::string& prompt) {
-        std::string current_buffer;
-        std::cout << prompt << std::flush;
+ std::string current_buffer;
+    std::cout << prompt << std::flush;
 
-        enableRawMode();
+    enableRawMode();
 
-        int history_index = history.size(); 
-        char c;
+    int history_index = history.size(); 
+    
+    while (true) {
+#ifdef _WIN32
+        int key = _getch();
         
-        while (read(STDIN_FILENO, &c, 1) == 1) {
-            if (c == '\n') { // Enter
-                std::cout << "\r\n";
-                break;
-            } 
-            // Backspace/Delete
-            else if (c == 127 || c == 8) { 
-                if (!current_buffer.empty()) {
-                    current_buffer.pop_back();
-                    std::cout << "\b \b" << std::flush;
-                }
-            } 
-            // Escape sequences for arrow keys
-            else if (c == '\033') { 
-                char seq[3];
-                if (read(STDIN_FILENO, &seq[0], 1) == 0) continue;
-                if (read(STDIN_FILENO, &seq[1], 1) == 0) continue;
-
-                if (seq[0] == '[') {
-                    if (seq[1] == 'A') {
-                        if (history_index > 0) {
-                            history_index--;
-                            clearCurrentLine(current_buffer.length());
-                            current_buffer = history[history_index];
-                            std::cout << current_buffer << std::flush;
-                        }
-                    } else if (seq[1] == 'B') {
-                        if (history_index < (int)history.size()) {
-                            history_index++;
-                            clearCurrentLine(current_buffer.length());
-                            
-                            if (history_index < (int)history.size()) {
-                                current_buffer = history[history_index];
-                                std::cout << current_buffer << std::flush;
-                            } else {
-                                current_buffer = ""; // Successfully back to empty
-                            }
-                        }
-                    }
-                    // "Delete" key (sequence is usually \033[3~)
-                    else if (seq[1] > '0' && seq[1] < '9') {
-                        read(STDIN_FILENO, &seq[2], 1);
-                    }
-                }
-            } 
-            // Only allow printable characters
-            else if (!iscntrl(c)) { 
-                current_buffer += c;
-                std::cout << c << std::flush;
+        // Enter (Windows uses \r which is 13)
+        if (key == 13) { 
+            std::cout << "\r\n";
+            break;
+        } 
+        //Handle Backspace (Windows uses 8)
+        else if (key == 8) {
+            if (!current_buffer.empty()) {
+                current_buffer.pop_back();
+                std::cout << "\b \b" << std::flush;
             }
         }
+        else if (key == 0 || key == 224) {
+            int arrow = _getch();
+            if (arrow == 72) {
+                if (history_index > 0) {
+                    history_index--;
+                    clearCurrentLine(current_buffer.length());
+                    current_buffer = history[history_index];
+                    std::cout << current_buffer << std::flush;
+                }
+            } 
+            else if (arrow == 80) {
+                if (history_index < (int)history.size()) {
+                    history_index++;
+                    clearCurrentLine(current_buffer.length());
+                    if (history_index < (int)history.size()) {
+                        current_buffer = history[history_index];
+                    } else {
+                        current_buffer = "";
+                    }
+                    std::cout << current_buffer << std::flush;
+                }
+            }
+        }
+        else if (!iscntrl(key)) {
+            current_buffer += (char)key;
+            std::cout << (char)key << std::flush;
+        }
 
-        disableRawMode();
-        return current_buffer;
+#else
+    char c;
+        if (read(STDIN_FILENO, &c, 1) != 1) break;
+
+        if (c == '\n') {
+            std::cout << "\r\n";
+            break;
+        } 
+        else if (c == 127 || c == 8) {
+            if (!current_buffer.empty()) {
+                current_buffer.pop_back();
+                std::cout << "\b \b" << std::flush;
+            }
+        } 
+        else if (c == '\033') {
+            char seq[3];
+            if (read(STDIN_FILENO, &seq[0], 1) == 0) continue;
+            if (read(STDIN_FILENO, &seq[1], 1) == 0) continue;
+
+            if (seq[0] == '[') {
+                if (seq[1] == 'A') { // UP
+                    if (history_index > 0) {
+                        history_index--;
+                        clearCurrentLine(current_buffer.length());
+                        current_buffer = history[history_index];
+                        std::cout << current_buffer << std::flush;
+                    }
+                } else if (seq[1] == 'B') { // DOWN
+                    if (history_index < (int)history.size()) {
+                        history_index++;
+                        clearCurrentLine(current_buffer.length());
+                        if (history_index < (int)history.size()) {
+                            current_buffer = history[history_index];
+                        } else {
+                            current_buffer = ""; 
+                        }
+                        std::cout << current_buffer << std::flush;
+                    }
+                }
+                else if (seq[1] > '0' && seq[1] < '9') {
+                    read(STDIN_FILENO, &seq[2], 1);
+                }
+            }
+        } 
+        else if (!iscntrl(c)) { 
+            current_buffer += c;
+            std::cout << c << std::flush;
+        }
+#endif
     }
+
+    disableRawMode();
+    return current_buffer;
+}
 };
 
 int main(int argc, char* argv[]) {
