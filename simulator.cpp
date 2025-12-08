@@ -239,34 +239,85 @@ Peer& peer = it->second;
             handle_keepalive(peer, static_cast<const KeepaliveMessage&>(message), verbose);
             break;
         case MessageType::NOTIFICATION:
-        if (verbose) {
-            std::cout << router_id_ << " <- " << peer.peer_ip << ": Received NOTIFICATION. Tearing down session." << std::endl;
-        }
-        if (total_trust_values_.count(peer.peer_ip)) {
-            total_trust_values_[peer.peer_ip] /= 2.0;
-        }
-        peer.state = SessionState::IDLE;
-
-        // Remove all routes learned from this peer ---
         {
-            std::vector<IpPrefix> prefixes_to_remove;
-            for (const auto& [prefix, route] : routing_table_) {
-                if (route.next_hop_ip == peer.peer_ip) {
-                    prefixes_to_remove.push_back(prefix);
-                }
-            }
+           if (verbose) {
+        std::cout << router_id_ << " <- " << peer.peer_ip << ": Received NOTIFICATION. Tearing down session." << std::endl;
+    }
+    if (total_trust_values_.count(peer.peer_ip)) {
+        total_trust_values_[peer.peer_ip] /= 2.0;
+    }
+    peer.state = SessionState::IDLE;
 
-            if (!prefixes_to_remove.empty()) {
-                if (verbose) {
-                    std::cout << "    " << router_id_ << ": Removing " << prefixes_to_remove.size() << " stale route(s) from peer " << peer.peer_ip << "." << std::endl;
-                }
-                for (const auto& prefix : prefixes_to_remove) {
-                    routing_table_.erase(prefix);
-                }
-                // For this project, simply removing the routes is sufficient.
+    std::vector<IpPrefix> affected_prefixes;
+    
+    for (auto& [prefix, peer_map] : bgp_table_) {
+        bool this_prefix_affected = false;
+
+        // Remove direct advertisements from the dead peer
+        if (peer_map.count(peer.peer_ip)) {
+            peer_map.erase(peer.peer_ip); 
+            this_prefix_affected = true;
+        }
+
+        auto it = peer_map.begin();
+        while (it != peer_map.end()) {
+            if (it->second.next_hop_ip == peer.peer_ip) {
+                it = peer_map.erase(it);
+                this_prefix_affected = true;
+            } else {
+                ++it;
             }
         }
-        break;
+
+        if (this_prefix_affected) {
+            affected_prefixes.push_back(prefix);
+        }
+    }
+    bool table_changed = false;
+
+    for (const auto& prefix : affected_prefixes) {
+        bool active_route_is_dead = false;
+        if (routing_table_.count(prefix)) {
+            if (routing_table_[prefix].next_hop_ip == peer.peer_ip) {
+                active_route_is_dead = true;
+            }
+        }
+
+        if (active_route_is_dead) {
+            routing_table_.erase(prefix);
+            table_changed = true;
+            if (verbose) {
+                 std::cout << "    " << router_id_ << ": Active path for " 
+                           << prefix.network_address << "/" << (int)prefix.prefix_length 
+                           << " was via " << peer.peer_ip << ". Invalidating." << std::endl;
+            }
+        }
+
+        if (find_and_install_best_path(prefix)) {
+            table_changed = true;
+            if (verbose) {
+                std::cout << "    " << router_id_ << ": Updated best path for " 
+                          << prefix.network_address << "/" << (int)prefix.prefix_length 
+                          << " (Failover successful)." << std::endl;
+            }
+        } 
+        else if (active_route_is_dead) {
+            if (verbose) {
+                std::cout << "    " << router_id_ << ": No backup path for " 
+                          << prefix.network_address << "/" << (int)prefix.prefix_length 
+                          << ". Removing route." << std::endl;
+            }
+        }
+    }
+    
+    if (table_changed) {
+        if (verbose) {
+             std::cout << "    " << router_id_ << "'s routing table changed. Propagating updates." << std::endl;
+        }
+        resend_routes(false);
+    }
+}
+            break;
         case MessageType::TRUST_MESSAGE:
             handle_trust_message(peer, static_cast<const TrustMessage&>(message));
             break;

@@ -98,6 +98,9 @@ To run the simulator, you must provide a topology configuration file using the `
 The simulator will load the network, allow it to converge, and then present you with an interactive `BGP-Sim>` prompt.
 
 ### Command Reference
+
+#### For the full user manual, see [User manual (PDF)](docs/User-manual.pdf)
+
 The following commands are available in the simulator's CLI:
 
 | Command | Description |
