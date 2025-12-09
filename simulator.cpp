@@ -456,7 +456,6 @@ void add_policy_rule(const Policy& rule) {
             send_withdrawal_all(rule.match_prefix);
 
         } else {
-            
             std::cout << "Applying specific outbound deny for " << rule.match_prefix.to_string() 
                       << " to peer " << rule.match_peer_ip << "." << std::endl;
             
@@ -487,7 +486,6 @@ void add_policy_rule(const Policy& rule) {
                 ++it;
             }
         }
-
         if (path_changed) {
             // The old best path might have been removed. Find the new best one.
             find_and_install_best_path(rule.match_prefix);
@@ -597,7 +595,6 @@ void add_policy_rule(const Policy& rule) {
                             }
                         }
                     }
-
                     Route new_advertisement = route;
                     if (sending_to_ebgp) {
                         new_advertisement.as_path.push_front(this->as_number_);
@@ -845,46 +842,37 @@ for (const auto& new_route_info : message.advertised_routes) {
             }
             if (route_reflector_clients_.empty()) 
             {
-                // STANDARD BGP ROUTER (Not an RR)
-                // We obey the iBGP Split-Horizon rule.
-                
+                // STANDARD BGP ROUTER (Not an RR)      
                 for (auto const& [next_peer_ip, next_peer] : peers_) {
                     if (next_peer_ip == peer.peer_ip || next_peer.state != SessionState::ESTABLISHED) {
                         continue;
                     }
 
                     // iBGP Split Horizon Rule Check
-                    // (Don't advertise a route from an iBGP peer to another iBGP peer)
+                    // (Don't advertise routes from iBGP peers to each other)
                     bool source_is_ibgp = (peer.peer_as == this->as_number_);
                     bool dest_is_ibgp = (next_peer.peer_as == this->as_number_);
                     
                     if (source_is_ibgp && dest_is_ibgp) {
-                        // This is the split-horizon rule. Don't propagate.
+                        // Don't propagate
                         if (verbose) {
                              std::cout << "   Skipping peer " << next_peer_ip << " (iBGP Split Horizon)." << std::endl;
                         }
                         continue; 
                     }
-                    
                     // This peer is OK to send to (either eBGP, or from eBGP to iBGP)
                     UpdateMessage downstream_update;
-
                     for (const auto& withdrawn_prefix : message.withdrawn_routes) {
                          // Only propagate withdrawals if our best path was affected
                         if (!routing_table_.count(withdrawn_prefix)) {
                              downstream_update.withdrawn_routes.push_back(withdrawn_prefix);
                         }
                     }
-
                     // Propagate advertisements
                     for (const auto& [prefix, route] : routing_table_) {
-                        // We only need to advertise the routes that just changed.
-                        // A simple way is to check if the new best route is the one from 'peer'.
+                        // Only need to advertise the routes that just changed
+                        // A simple way is to check if the new best route is the one from peer
                         if (bgp_table_.count(prefix) && bgp_table_.at(prefix).count(peer.peer_ip)) {
-                            // The route we received from 'peer' may not have peer.peer_ip as the next-hop
-                            // ( iBGP preserves next-hop). Instead of comparing next-hop with peer IP,
-                            // check whether the route learned from 'peer' is the same as the installed best
-                            // route (compare next_hop and AS path).
                             const Route& source_route = bgp_table_.at(prefix).at(peer.peer_ip);
                             const Route& best_route = routing_table_.at(prefix);
                             if (source_route.next_hop_ip == best_route.next_hop_ip
@@ -913,11 +901,11 @@ for (const auto& new_route_info : message.advertised_routes) {
                 // routes received from iBGP peers are not re-advertised to other iBGP peers.
                 //
                 // Route reflection rules:
-                // 1. Routes from eBGP peers: Advertised to ALL iBGP peers (clients and non-clients)
-                // 2. Routes from RR clients: Advertised to ALL other peers (both clients and non-clients)
-                // 3. Routes from non-client iBGP peers: Advertised ONLY to RR clients
-                // 4. Routes originated by this router: Advertised to ALL iBGP peers
-                // 5. Routes to eBGP peers: Always advertised if policy allows
+                // Routes from eBGP peers: Advertised to all iBGP peers (clients and non-clients)
+                // RR clients: Advertised to ALL other peers (both clients and non-clients)
+                // Non-client iBGP peers: Advertised ONLY to RR clients
+                // Originated by this router: Advertised to all iBGP peers
+                // Routes to eBGP peers: Always advertised if policy allows
 
                 for (auto const& [next_peer_ip, next_peer] : peers_) {
                     if (next_peer_ip == peer.peer_ip || next_peer.state != SessionState::ESTABLISHED) {
@@ -932,20 +920,15 @@ for (const auto& new_route_info : message.advertised_routes) {
                              downstream_update.withdrawn_routes.push_back(withdrawn_prefix);
                         }
                     }
-
                     bool sending_to_client = route_reflector_clients_.count(next_peer_ip);
                     bool sending_to_ibgp = (next_peer.peer_as == this->as_number_);
                     bool sending_to_ebgp = !sending_to_ibgp;
-
                     // Iterate over all best routes (not just the changed ones)
-                    // This is simpler and more robust for RR logic
                     for (const auto& [prefix, route] : routing_table_) {
-
-                        // -Find the source of this best route
+                        // Find the source of this best route
                         bool best_route_originated_by_us = (route.next_hop_ip == this->router_id_);
                         bool best_route_from_client = false;
                         bool best_route_from_non_client_ibgp = false;
-
                         if (!best_route_originated_by_us) {
                             // Find the peer who gave us this best path
                             std::string best_path_source_peer_ip = "";
@@ -957,7 +940,6 @@ for (const auto& new_route_info : message.advertised_routes) {
                                     }
                                 }
                             }
-                            
                             if (peers_.count(best_path_source_peer_ip)) {
                                 Peer& source_peer = peers_.at(best_path_source_peer_ip);
                                 if (source_peer.peer_as != this->as_number_) {
@@ -973,7 +955,6 @@ for (const auto& new_route_info : message.advertised_routes) {
                                 // Peer isn't in our list? Must be eBGP.
                             }
                         }
-
                         Route new_advertisement = route;
                         if (sending_to_ebgp) {
                             new_advertisement.as_path.push_front(this->as_number_);
@@ -981,22 +962,20 @@ for (const auto& new_route_info : message.advertised_routes) {
                         if (!apply_outbound_policies(new_advertisement, next_peer)) {
                             continue; // Denied by outbound policy
                         }
-
                         if (sending_to_ebgp) {
                             // Always send best routes to eBGP peers
                             downstream_update.advertised_routes.push_back(new_advertisement);
                         } else { 
                             // Sending to an iBGP peer (client or non-client)
                             if (best_route_from_client) {
-                                // From client -> Reflect to ALL (clients and non-clients)
+                                // From client iBGP: Reflect to all iBGP peers
                                 downstream_update.advertised_routes.push_back(new_advertisement);
                             } else if (best_route_from_non_client_ibgp) {
-                                // Route from non-client iBGP: Reflect to only clients
+                                // Non-client iBGP: Reflect to only clients
                                 if (sending_to_client) {
                                     downstream_update.advertised_routes.push_back(new_advertisement);
                                 }
                             } else { // best_route_from_ebgp or best_route_originated_by_us
-                                // Route from eBGP or originated by us -> Reflect to ALL iBGP peers
                                 downstream_update.advertised_routes.push_back(new_advertisement);
                             }
                         }
